@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@color/bg_normal"
     android:orientation="vertical"
     android:padding="16dp">
 
@@ -11,88 +13,140 @@
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btn_diagnostics_back"
+            style="@style/Widget.GenieX.Button.Secondary"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Back"
-            android:textAllCaps="false" />
+            android:layout_height="44dp"
+            android:minHeight="44dp"
+            android:text="Back" />
 
-        <TextView
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
+            android:layout_marginStart="14dp"
             android:layout_weight="1"
-            android:text="Diagnostics"
-            android:textSize="24sp"
-            android:textStyle="bold" />
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Diagnostics"
+                android:textColor="@color/font_black"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="Export logs and troubleshoot model/runtime issues"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+        </LinearLayout>
     </LinearLayout>
 
-    <TextView
-        android:id="@+id/tv_diagnostics_summary"
+    <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:textIsSelectable="true" />
+        android:layout_marginTop="14dp"
+        app:cardBackgroundColor="@color/surface"
+        app:cardCornerRadius="20dp"
+        app:cardElevation="0dp"
+        app:strokeColor="@color/outline_soft"
+        app:strokeWidth="1dp">
+
+        <TextView
+            android:id="@+id/tv_diagnostics_summary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="16dp"
+            android:textColor="@color/font_black"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
+    </com.google.android.material.card.MaterialCardView>
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="10dp"
         android:orientation="horizontal">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btn_diagnostics_save"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Save ZIP"
-            android:textAllCaps="false" />
+            style="@style/Widget.GenieX.Button.Primary"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="Save ZIP" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btn_diagnostics_share"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            style="@style/Widget.GenieX.Button.Tonal"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
             android:layout_marginStart="8dp"
-            android:text="Share ZIP"
-            android:textAllCaps="false" />
-
-        <Button
-            android:id="@+id/btn_diagnostics_refresh"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:text="Refresh"
-            android:textAllCaps="false" />
+            android:layout_weight="1"
+            android:text="Share ZIP" />
     </LinearLayout>
 
-    <Button
-        android:id="@+id/btn_diagnostics_clear"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Clear logs"
-        android:textAllCaps="false" />
+        android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_diagnostics_refresh"
+            style="@style/Widget.GenieX.Button.Secondary"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="Refresh" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_diagnostics_clear"
+            style="@style/Widget.GenieX.Button.Danger"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="Clear logs" />
+    </LinearLayout>
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="16dp"
+        android:layout_marginBottom="8dp"
         android:text="Recent application log"
+        android:textColor="@color/font_black"
+        android:textSize="15sp"
         android:textStyle="bold" />
 
-    <ScrollView
+    <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:background="#F5F5F5"
-        android:padding="8dp">
+        app:cardBackgroundColor="@color/surface"
+        app:cardCornerRadius="18dp"
+        app:cardElevation="0dp"
+        app:strokeColor="@color/outline_soft"
+        app:strokeWidth="1dp">
 
-        <TextView
-            android:id="@+id/tv_diagnostics_log"
+        <ScrollView
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:fontFamily="monospace"
-            android:textIsSelectable="true"
-            android:textSize="11sp" />
-    </ScrollView>
+            android:layout_height="match_parent"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/tv_diagnostics_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textColor="@color/font_black"
+                android:textIsSelectable="true"
+                android:textSize="11sp" />
+        </ScrollView>
+    </com.google.android.material.card.MaterialCardView>
 </LinearLayout>

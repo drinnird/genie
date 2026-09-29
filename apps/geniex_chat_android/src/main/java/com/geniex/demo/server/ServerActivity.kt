@@ -3,6 +3,8 @@ package com.geniex.demo.server
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.fragment.app.FragmentActivity
@@ -28,6 +30,8 @@ class ServerActivity : FragmentActivity() {
         binding.btnServerToggle.setOnClickListener {
             if (LocalApiServer.isRunning()) stopServer() else startServer()
         }
+        binding.btnCopyWebUrl.setOnClickListener { copy("Web chat URL", LocalApiServer.webUrl()) }
+        binding.btnOpenWebUi.setOnClickListener { openWebUi() }
         binding.btnCopyApiUrl.setOnClickListener { copy("API URL", LocalApiServer.apiUrl()) }
         binding.btnCopyApiKey.setOnClickListener {
             val key = binding.etApiKey.text?.toString().orEmpty()
@@ -58,8 +62,8 @@ class ServerActivity : FragmentActivity() {
         AppPreferences.setServerPort(this, port)
         AppPreferences.setLanEnabled(this, lan)
         AppPreferences.setApiKey(this, key)
-        LocalApiServer.start(port, lan, key).fold(
-            onSuccess = { Toast.makeText(this, "API server started.", Toast.LENGTH_SHORT).show() },
+        LocalApiServer.start(applicationContext, port, lan, key).fold(
+            onSuccess = { Toast.makeText(this, "Web chat and API server started.", Toast.LENGTH_SHORT).show() },
             onFailure = { Toast.makeText(this, "Server failed: ${it.message}", Toast.LENGTH_LONG).show() },
         )
         refreshUi()
@@ -76,9 +80,23 @@ class ServerActivity : FragmentActivity() {
         binding.btnServerToggle.text = if (running) "Stop server" else "Start server"
         binding.tvLocalAddress.text = if (running) LocalApiServer.localhostUrl() else "—"
         binding.tvLanAddress.text = if (running) LocalApiServer.lanUrl() ?: "LAN access disabled" else "—"
+        binding.tvWebAddress.text = if (running) LocalApiServer.webUrl() else "—"
         binding.tvApiAddress.text = if (running) LocalApiServer.apiUrl() else "—"
-        binding.tvServerModel.text = InferenceBridge.activeModelName ?: "No model loaded"
+        binding.tvServerModel.text = buildString {
+            append(InferenceBridge.activeModelName ?: "No model loaded")
+            InferenceBridge.requestedComputeUnit?.let { append(" • ").append(it.uppercase()) }
+        }
+        binding.btnCopyWebUrl.isEnabled = running
+        binding.btnOpenWebUi.isEnabled = running
         binding.btnCopyApiUrl.isEnabled = running
+    }
+
+    private fun openWebUi() {
+        if (!LocalApiServer.isRunning()) return
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(LocalApiServer.webUrl()))
+        runCatching { startActivity(intent) }.onFailure {
+            Toast.makeText(this, "No browser is available to open the web chat.", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun copy(label: String, value: String) {

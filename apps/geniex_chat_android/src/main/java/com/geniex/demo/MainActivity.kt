@@ -6,6 +6,7 @@ package com.geniex.demo
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
@@ -81,6 +82,7 @@ import com.gyf.immersionbar.ktx.immersionBar
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -148,7 +150,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         immersionBar {
-            statusBarColorInt(Color.WHITE)
+            statusBarColorInt(getColor(R.color.bg_normal))
             statusBarDarkFont(true)
         }
         initData()
@@ -283,8 +285,15 @@ class MainActivity : FragmentActivity() {
             val available = runCatching { isModelDownloaded(model) }.getOrDefault(false)
             runOnUiThread {
                 val active = InferenceBridge.activeModelId == model.id
+                val anyModelLoaded = hasLoadedModel()
+                btnLoadModel.visibility = if (anyModelLoaded) View.GONE else View.VISIBLE
+                btnLoadModel.isEnabled = available && !anyModelLoaded
+                btnLoadModel.text = if (available) "Load model" else "Download in Models"
+                btnUnloadModel.visibility = if (anyModelLoaded) View.VISIBLE else View.GONE
+                btnStop.visibility = if (anyModelLoaded && isGenerating) View.VISIBLE else View.GONE
                 tvSelectedModelStatus.text = when {
                     active -> "Active • ${model.quant ?: model.runtime.orEmpty()} • ${InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary}"
+                    anyModelLoaded -> "Selected • ${model.quant ?: model.runtime.orEmpty()} • unload the active model to switch"
                     available -> "Available • ${model.quant ?: model.runtime.orEmpty()} • ${model.computeSummary}"
                     else -> "Not downloaded • ${model.quant ?: model.runtime.orEmpty()} • ${model.computeSummary}"
                 }
@@ -364,7 +373,7 @@ class MainActivity : FragmentActivity() {
                     Toast.LENGTH_SHORT,
                 ).show()
             // change UI
-            btnAddImage.visibility = View.INVISIBLE
+            btnAddImage.visibility = View.GONE
             if (isLoadVlmModel) {
                 btnAddImage.visibility = View.VISIBLE
             }
@@ -382,7 +391,7 @@ class MainActivity : FragmentActivity() {
             vTip.visibility = View.GONE
             Toast.makeText(this@MainActivity, tip, Toast.LENGTH_SHORT).show()
             // change UI
-            btnAddImage.visibility = View.INVISIBLE
+            btnAddImage.visibility = View.GONE
             btnUnloadModel.visibility = View.GONE
             llLoading.visibility = View.INVISIBLE
             refreshSelectedModelUi()
@@ -402,6 +411,7 @@ class MainActivity : FragmentActivity() {
             val hasText = etInput.text?.isNotBlank() == true
             val hasAttachment = savedImageFiles.isNotEmpty()
             btnSend.isEnabled = hasLoadedModel() && !isGenerating && (hasText || hasAttachment)
+            btnStop.visibility = if (hasLoadedModel() && isGenerating) View.VISIBLE else View.GONE
         }
     }
 
@@ -430,6 +440,37 @@ class MainActivity : FragmentActivity() {
                 onLoadModelFailed("model paths unavailable — pull it first")
                 return@launch
             }
+
+            // GPU model loading can temporarily require another large chunk of
+            // shared system memory in addition to the GGUF itself. Android may
+            // kill the entire process instead of delivering an exception when
+            // that pressure becomes too high, so preflight the load and prefer
+            // a clear error over a low-memory process death.
+            if (requestedCompute == ComputeUnitValue.GPU.value) {
+                val availableBytes = getAvailableMemoryBytes()
+                val modelBytes = File(paths.model_path).takeIf { it.isFile }?.length() ?: 0L
+                val recommendedBytes =
+                    if (modelBytes > 0L) {
+                        modelBytes + maxOf(GPU_MIN_EXTRA_HEADROOM_BYTES, modelBytes / 2)
+                    } else {
+                        GPU_MIN_EXTRA_HEADROOM_BYTES
+                    }
+                DiagnosticsLogger.log(
+                    "INFO",
+                    "Memory",
+                    "GPU preflight model=${selectModelData.displayName} available=${formatGiB(availableBytes)} " +
+                        "model=${formatGiB(modelBytes)} recommended=${formatGiB(recommendedBytes)}",
+                )
+                if (availableBytes > 0L && availableBytes < recommendedBytes) {
+                    onLoadModelFailed(
+                        "GPU load blocked to prevent a low-memory crash. " +
+                            "Available ${formatGiB(availableBytes)}; about ${formatGiB(recommendedBytes)} recommended. " +
+                            "Use NPU, close other apps, then try GPU again.",
+                    )
+                    return@launch
+                }
+            }
+
             // Manifest-written runtime_id wins when present; fall back to
             // the user's UI selection for GGUF models that skip the manifest.
             val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }
@@ -893,7 +934,7 @@ class MainActivity : FragmentActivity() {
                     vTip.visibility = View.GONE
                     btnUnloadModel.visibility = View.GONE
                     btnStop.visibility = View.GONE
-                    btnAddImage.visibility = View.INVISIBLE
+                    btnAddImage.visibility = View.GONE
                     messages.clear()
                     clearImages()
                     reloadRecycleView()
@@ -918,11 +959,13 @@ class MainActivity : FragmentActivity() {
                         vlmWrapper.stopStream()
                         vlmWrapper.destroy()
                         vlmChatList.clear()
+                        settleAfterNativeUnload()
                         handleUnloadResult(0)
                     } else if (isLoadLlmModel) {
                         llmWrapper.stopStream()
                         llmWrapper.destroy()
                         chatList.clear()
+                        settleAfterNativeUnload()
                         handleUnloadResult(0)
                     } else {
                         handleUnloadResult(0)
@@ -951,6 +994,29 @@ class MainActivity : FragmentActivity() {
                 }
             }
         }
+    }
+
+    private fun getAvailableMemoryBytes(): Long {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val info = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(info)
+        return info.availMem
+    }
+
+    private fun formatGiB(bytes: Long): String =
+        String.format(Locale.US, "%.2f GiB", bytes.toDouble() / GIB_BYTES.toDouble())
+
+    private suspend fun settleAfterNativeUnload() {
+        // GenieX may release large native / driver allocations asynchronously.
+        // Give those allocations a short chance to drain before the user swaps
+        // from NPU to GPU (or vice versa), which reduces transient peak memory.
+        System.gc()
+        delay(MODEL_UNLOAD_SETTLE_MS)
+        DiagnosticsLogger.log(
+            "INFO",
+            "Memory",
+            "post-unload available=${formatGiB(getAvailableMemoryBytes())}",
+        )
     }
 
     private fun startLoadModel(selectModelData: ModelData) {
@@ -1367,6 +1433,9 @@ class MainActivity : FragmentActivity() {
          * model by [GgufVisionReader], since feeding a tower a smaller square
          * than it was trained on silently discards detail.
          */
+        private const val GIB_BYTES = 1024L * 1024L * 1024L
+        private const val GPU_MIN_EXTRA_HEADROOM_BYTES = GIB_BYTES
+        private const val MODEL_UNLOAD_SETTLE_MS = 1500L
         private const val FALLBACK_VLM_IMAGE_SIZE = 448
 
         /** Room for an image, its answer, and a follow-up turn, over the image cost. */

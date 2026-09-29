@@ -28,6 +28,7 @@ jobs:
           test -f apps/geniex_chat_android/build.gradle
           test -f apps/geniex_chat_android/settings.gradle
           test -f apps/geniex_chat_android/src/main/AndroidManifest.xml
+          test -f apps/geniex_chat_android/src/main/assets/web/index.html
           if grep -R --line-number -E 'apps/_shared|_shared/android/common.gradle|ANDROID_(COMPILE|MIN|TARGET)_API|ANDROID_NDK_VERSION' \
               apps/geniex_chat_android/build.gradle; then
             echo "Unexpected shared-build dependency remains in build.gradle."

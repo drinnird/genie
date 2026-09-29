@@ -4,9 +4,10 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginBottom="12dp"
-    app:cardCornerRadius="14dp"
-    app:cardElevation="1dp"
-    app:strokeColor="#E0E0E0"
+    app:cardBackgroundColor="@color/surface"
+    app:cardCornerRadius="20dp"
+    app:cardElevation="0dp"
+    app:strokeColor="@color/outline_soft"
     app:strokeWidth="1dp">
 
     <LinearLayout
@@ -19,6 +20,7 @@
             android:id="@+id/tv_model_name"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:textColor="@color/font_black"
             android:textSize="18sp"
             android:textStyle="bold" />
 
@@ -26,26 +28,34 @@
             android:id="@+id/tv_model_meta"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textColor="#424242"
+            android:layout_marginTop="5dp"
+            android:textColor="@color/primary_dark"
+            android:textSize="13sp"
             android:textStyle="bold" />
 
         <TextView
             android:id="@+id/tv_model_repo"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="5dp"
             android:ellipsize="middle"
             android:maxLines="1"
-            android:textColor="#757575"
+            android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 
         <TextView
             android:id="@+id/tv_model_status"
-            android:layout_width="match_parent"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_input_box_background"
+            android:paddingStart="10dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="6dp"
             android:text="Not downloaded"
+            android:textColor="@color/font_black"
+            android:textSize="12sp"
             android:textStyle="bold" />
 
         <ProgressBar
@@ -53,39 +63,41 @@
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="10dp"
             android:max="100"
+            android:progressTint="@color/primary"
             android:visibility="gone" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:gravity="end"
+            android:layout_marginTop="14dp"
             android:orientation="horizontal">
 
-            <Button
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btn_model_download"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Download"
-                android:textAllCaps="false" />
+                style="@style/Widget.GenieX.Button.Secondary"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:text="Download" />
 
-            <Button
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btn_model_use"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                style="@style/Widget.GenieX.Button.Primary"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
                 android:layout_marginStart="8dp"
-                android:text="Use"
-                android:textAllCaps="false" />
-
-            <Button
-                android:id="@+id/btn_model_delete"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:text="Delete"
-                android:textAllCaps="false" />
+                android:layout_weight="1"
+                android:text="Use" />
         </LinearLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_model_delete"
+            style="@style/Widget.GenieX.Button.Danger"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:text="Delete from device" />
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

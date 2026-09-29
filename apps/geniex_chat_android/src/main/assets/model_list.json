@@ -23,7 +23,7 @@
     "modelName": "unsloth/Qwen3.5-0.8B-GGUF",
     "quant": "Q4_0",
     "hub": "HUGGINGFACE",
-    "type": "vlm",
+    "type": "chat",
     "runtime": "llama_cpp"
   },
   {
@@ -32,7 +32,7 @@
     "modelName": "unsloth/Qwen3.5-2B-GGUF",
     "quant": "Q4_0",
     "hub": "HUGGINGFACE",
-    "type": "vlm",
+    "type": "chat",
     "runtime": "llama_cpp"
   },
   {
@@ -41,7 +41,7 @@
     "modelName": "unsloth/Qwen3.5-4B-GGUF",
     "quant": "Q4_0",
     "hub": "HUGGINGFACE",
-    "type": "vlm",
+    "type": "chat",
     "runtime": "llama_cpp"
   },
   {

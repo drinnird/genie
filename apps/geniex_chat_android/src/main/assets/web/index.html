@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>GenieX Local Chat</title>
+  <style>
+    :root {
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color-scheme: light dark;
+      --bg: #f7f7f8;
+      --panel: #ffffff;
+      --text: #171717;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #4f46e5;
+      --accentText: #ffffff;
+      --user: #e8e7ff;
+      --assistant: #ffffff;
+      --danger: #b91c1c;
+      --ok: #137333;
+      --shadow: 0 8px 30px rgba(0,0,0,.06);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d0f12;
+        --panel: #15181d;
+        --text: #f3f4f6;
+        --muted: #9ca3af;
+        --line: #2b3038;
+        --accent: #c7c5ff;
+        --accentText: #171717;
+        --user: #1e365e;
+        --assistant: #15181d;
+        --danger: #fca5a5;
+        --ok: #86efac;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+    body { min-height: 100dvh; }
+    button, input, textarea { font: inherit; }
+    button { min-height: 44px; }
+    .app { min-height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
+    header {
+      position: sticky; top: 0; z-index: 5;
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
+      padding: max(12px, env(safe-area-inset-top)) 16px 12px;
+    }
+    .header-row { max-width: 960px; margin: 0 auto; display: flex; gap: 12px; align-items: center; }
+    .title { min-width: 0; flex: 1; }
+    h1 { font-size: 18px; margin: 0; }
+    .sub { font-size: 12px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .badge { border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; font-size: 12px; white-space: nowrap; }
+    .badge.ok { color: var(--ok); }
+    .badge.bad { color: var(--danger); }
+    .toolbar { max-width: 960px; margin: 10px auto 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .toolbar input {
+      flex: 1 1 220px; min-width: 0; border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 12px; background: var(--bg); color: var(--text);
+    }
+    .ghost {
+      border: 1px solid var(--line); background: transparent; color: var(--text);
+      border-radius: 10px; padding: 8px 12px; cursor: pointer;
+    }
+    main { width: 100%; }
+    .messages { max-width: 960px; margin: 0 auto; padding: 18px 16px 140px; display: flex; flex-direction: column; gap: 14px; }
+    .empty { margin: 12vh auto 0; max-width: 520px; text-align: center; color: var(--muted); padding: 24px; }
+    .empty strong { display: block; color: var(--text); font-size: 20px; margin-bottom: 8px; }
+    .message { display: flex; gap: 10px; align-items: flex-start; }
+    .message.user { justify-content: flex-end; }
+    .bubble {
+      max-width: min(82%, 760px); padding: 12px 14px; border-radius: 16px; line-height: 1.5;
+      border: 1px solid var(--line); background: var(--assistant); box-shadow: var(--shadow);
+      white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .user .bubble { background: var(--user); box-shadow: none; }
+    .role { font-size: 11px; color: var(--muted); margin: 0 5px 4px; }
+    .user .role { text-align: right; }
+    .typing::after { content: "▍"; animation: blink 1s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .error { color: var(--danger); }
+    .composer-wrap {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 6;
+      padding: 10px 16px max(12px, env(safe-area-inset-bottom));
+      background: linear-gradient(to top, var(--bg) 75%, transparent);
+    }
+    .composer {
+      max-width: 960px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 18px; box-shadow: var(--shadow); padding: 10px; display: grid; gap: 8px;
+    }
+    textarea {
+      width: 100%; resize: none; min-height: 48px; max-height: 180px; border: 0; outline: 0;
+      padding: 8px 10px; background: transparent; color: var(--text); line-height: 1.4;
+    }
+    .composer-actions { display: flex; align-items: center; gap: 8px; }
+    .hint { flex: 1; color: var(--muted); font-size: 11px; padding-left: 8px; }
+    .send {
+      border: 0; border-radius: 12px; background: var(--accent); color: var(--accentText);
+      padding: 8px 18px; cursor: pointer; font-weight: 650;
+    }
+    .send:disabled { opacity: .45; cursor: not-allowed; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 600px) {
+      .messages { padding-left: 10px; padding-right: 10px; }
+      .bubble { max-width: 92%; }
+      .hint { display: none; }
+      .toolbar { align-items: stretch; }
+      .toolbar .ghost { flex: 1 1 auto; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="header-row">
+      <div class="title">
+        <h1>GenieX Local Chat</h1>
+        <div class="sub" id="modelText">Checking model…</div>
+      </div>
+      <div class="badge" id="statusBadge">Connecting</div>
+    </div>
+    <div class="toolbar">
+      <label class="sr-only" for="apiKey">API key</label>
+      <input id="apiKey" type="password" autocomplete="off" placeholder="API key (required for LAN access)">
+      <button class="ghost" id="saveKey" type="button">Use key</button>
+      <button class="ghost" id="copyApi" type="button">Copy API URL</button>
+      <button class="ghost" id="clearChat" type="button">Clear chat</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="messages" id="messages" aria-live="polite">
+      <div class="empty" id="emptyState">
+        <strong>Local, on-device chat</strong>
+        Load a model in the Android app, start this server, then chat here from the phone or another device on your LAN.
+      </div>
+    </div>
+  </main>
+
+  <div class="composer-wrap">
+    <div class="composer">
+      <label class="sr-only" for="prompt">Message</label>
+      <textarea id="prompt" rows="1" placeholder="Message the loaded model…" aria-label="Message"></textarea>
+      <div class="composer-actions">
+        <div class="hint">Enter to send • Shift+Enter for a new line</div>
+        <button class="send" id="send" type="button" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const els = {
+    messages: document.getElementById('messages'),
+    empty: document.getElementById('emptyState'),
+    prompt: document.getElementById('prompt'),
+    send: document.getElementById('send'),
+    key: document.getElementById('apiKey'),
+    saveKey: document.getElementById('saveKey'),
+    clear: document.getElementById('clearChat'),
+    copyApi: document.getElementById('copyApi'),
+    model: document.getElementById('modelText'),
+    status: document.getElementById('statusBadge')
+  };
+
+  let messages = [];
+  let busy = false;
+  let modelLoaded = false;
+  let apiKey = sessionStorage.getItem('geniex_api_key') || '';
+  els.key.value = apiKey;
+
+  function authHeaders(json = false) {
+    const h = {};
+    if (json) h['Content-Type'] = 'application/json';
+    if (apiKey) h['Authorization'] = `Bearer ${apiKey}`;
+    return h;
+  }
+
+  function setStatus(text, ok = false, bad = false) {
+    els.status.textContent = text;
+    els.status.classList.toggle('ok', ok);
+    els.status.classList.toggle('bad', bad);
+  }
+
+  function updateSendState() {
+    els.send.disabled = busy || !modelLoaded || !els.prompt.value.trim();
+  }
+
+  function growTextarea() {
+    els.prompt.style.height = 'auto';
+    els.prompt.style.height = `${Math.min(els.prompt.scrollHeight, 180)}px`;
+  }
+
+  function scrollBottom() {
+    requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }));
+  }
+
+  function addBubble(role, text = '', error = false) {
+    els.empty.hidden = true;
+    const row = document.createElement('div');
+    row.className = `message ${role === 'user' ? 'user' : 'assistant'}`;
+    const wrap = document.createElement('div');
+    const label = document.createElement('div');
+    label.className = 'role';
+    label.textContent = role === 'user' ? 'You' : 'Assistant';
+    const bubble = document.createElement('div');
+    bubble.className = `bubble${error ? ' error' : ''}`;
+    bubble.textContent = text;
+    wrap.append(label, bubble);
+    row.appendChild(wrap);
+    els.messages.appendChild(row);
+    scrollBottom();
+    return bubble;
+  }
+
+  function clearChat() {
+    messages = [];
+    els.messages.querySelectorAll('.message').forEach(node => node.remove());
+    els.empty.hidden = false;
+  }
+
+  async function refreshStatus() {
+    try {
+      const health = await fetch('/health', { cache: 'no-store' });
+      modelLoaded = health.ok;
+      if (!health.ok) {
+        els.model.textContent = 'No model loaded';
+        setStatus('No model', false, true);
+        updateSendState();
+        return;
+      }
+      const models = await fetch('/v1/models', { headers: authHeaders(), cache: 'no-store' });
+      if (models.status === 401) {
+        els.model.textContent = 'Model loaded • API key required';
+        setStatus('Key required', false, true);
+        updateSendState();
+        return;
+      }
+      if (!models.ok) throw new Error(`HTTP ${models.status}`);
+      const data = await models.json();
+      const model = data.data?.[0];
+      els.model.textContent = model ? `${model.name || model.id} • ${(model.compute || 'unknown').toUpperCase()}` : 'Model loaded';
+      setStatus('Ready', true, false);
+    } catch (err) {
+      modelLoaded = false;
+      els.model.textContent = 'Server unavailable';
+      setStatus('Offline', false, true);
+    }
+    updateSendState();
+  }
+
+  async function sendMessage() {
+    const text = els.prompt.value.trim();
+    if (!text || busy || !modelLoaded) return;
+
+    busy = true;
+    els.prompt.value = '';
+    growTextarea();
+    updateSendState();
+
+    messages.push({ role: 'user', content: text });
+    addBubble('user', text);
+    const assistantBubble = addBubble('assistant', '');
+    assistantBubble.classList.add('typing');
+
+    try {
+      const response = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          model: 'loaded-model',
+          messages,
+          stream: true,
+          max_tokens: 2048
+        })
+      });
+
+      if (response.status === 401) throw new Error('API key rejected. Enter the key shown in the Android Server screen.');
+      if (!response.ok || !response.body) {
+        let detail = `HTTP ${response.status}`;
+        try { detail = (await response.json()).error?.message || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let answer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let split;
+        while ((split = buffer.indexOf('\n\n')) >= 0) {
+          const event = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          for (const line of event.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+            const data = JSON.parse(payload);
+            if (data.error) throw new Error(data.error.message || 'Inference failed');
+            const token = data.choices?.[0]?.delta?.content || '';
+            if (token) {
+              answer += token;
+              assistantBubble.textContent = answer;
+              scrollBottom();
+            }
+          }
+        }
+      }
+
+      assistantBubble.classList.remove('typing');
+      messages.push({ role: 'assistant', content: answer });
+    } catch (err) {
+      assistantBubble.classList.remove('typing');
+      assistantBubble.classList.add('error');
+      assistantBubble.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+      updateSendState();
+      els.prompt.focus();
+    }
+  }
+
+  els.saveKey.addEventListener('click', () => {
+    apiKey = els.key.value.trim();
+    if (apiKey) sessionStorage.setItem('geniex_api_key', apiKey);
+    else sessionStorage.removeItem('geniex_api_key');
+    refreshStatus();
+  });
+
+  els.copyApi.addEventListener('click', async () => {
+    const value = `${location.origin}/v1`;
+    try {
+      await navigator.clipboard.writeText(value);
+      const old = els.copyApi.textContent;
+      els.copyApi.textContent = 'Copied';
+      setTimeout(() => { els.copyApi.textContent = old; }, 1200);
+    } catch (_) {
+      window.prompt('API URL', value);
+    }
+  });
+
+  els.clear.addEventListener('click', clearChat);
+  els.send.addEventListener('click', sendMessage);
+  els.prompt.addEventListener('input', () => { growTextarea(); updateSendState(); });
+  els.prompt.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  refreshStatus();
+  setInterval(refreshStatus, 5000);
+  growTextarea();
+})();
+</script>
+</body>
+</html>

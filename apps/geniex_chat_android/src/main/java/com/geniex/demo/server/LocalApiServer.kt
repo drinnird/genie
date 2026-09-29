@@ -1,15 +1,19 @@
 package com.geniex.demo.server
 
+import android.content.Context
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -27,11 +31,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 object LocalApiServer {
     private const val MAX_BODY_BYTES = 1024 * 1024
+    private const val DEFAULT_MAX_TOKENS = 2048
     private val running = AtomicBoolean(false)
     private val executor = Executors.newFixedThreadPool(4)
     private val json = Json { ignoreUnknownKeys = true }
 
     @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var appContext: Context? = null
+    @Volatile private var cachedWebUi: ByteArray? = null
+
     @Volatile var port: Int = 18181
         private set
     @Volatile var lanEnabled: Boolean = false
@@ -44,11 +52,13 @@ object LocalApiServer {
     fun isRunning(): Boolean = running.get()
 
     @Synchronized
-    fun start(port: Int, lanEnabled: Boolean, apiKey: String): Result<Unit> {
+    fun start(context: Context, port: Int, lanEnabled: Boolean, apiKey: String): Result<Unit> {
         if (running.get()) stop()
         return runCatching {
             val bindAddress = InetAddress.getByName(if (lanEnabled) "0.0.0.0" else "127.0.0.1")
             val socket = ServerSocket(port, 20, bindAddress)
+            this.appContext = context.applicationContext
+            this.cachedWebUi = null
             this.port = port
             this.lanEnabled = lanEnabled
             this.apiKey = apiKey
@@ -79,12 +89,15 @@ object LocalApiServer {
 
     fun lanUrl(): String? = if (lanEnabled) localIpv4()?.let { "http://$it:$port" } else null
 
+    fun webUrl(): String = "${lanUrl() ?: localhostUrl()}/"
+
     fun apiUrl(): String = "${lanUrl() ?: localhostUrl()}/v1"
 
     private fun acceptLoop(socket: ServerSocket) {
         while (running.get()) {
             try {
                 val client = socket.accept()
+                client.tcpNoDelay = true
                 executor.execute { handleClient(client) }
             } catch (e: Exception) {
                 if (running.get()) {
@@ -103,8 +116,8 @@ object LocalApiServer {
             try {
                 val requestLine = readLine(input) ?: return
                 val parts = requestLine.split(' ')
-                if (parts.size < 2) return writeJson(output, 400, errorJson("invalid request"))
-                val method = parts[0]
+                if (parts.size < 2) return writeJson(output, 400, errorJson(400, "invalid request", "invalid_request_error"))
+                val method = parts[0].uppercase()
                 val path = parts[1].substringBefore('?')
                 val headers = linkedMapOf<String, String>()
                 while (true) {
@@ -114,87 +127,341 @@ object LocalApiServer {
                     if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
                 }
 
-                if (!authorized(headers)) return writeJson(output, 401, errorJson("unauthorized"))
+                // The browser shell and health check are intentionally public, like llama-server.
+                // Model inference endpoints still require the configured API key in LAN mode.
+                when {
+                    method == "GET" && path == "/" -> return writeHtml(output, webUiBytes())
+                    method == "GET" && (path == "/health" || path == "/v1/health") -> return writeHealth(output)
+                    method == "GET" && path == "/favicon.ico" -> return writeEmpty(output, 204)
+                }
+
+                if (!authorized(headers)) {
+                    return writeJson(output, 401, errorJson(401, "Invalid API Key", "authentication_error"))
+                }
 
                 val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
                 if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
-                    return writeJson(output, 413, errorJson("request body too large"))
+                    return writeJson(output, 413, errorJson(413, "request body too large", "invalid_request_error"))
                 }
                 val body = if (contentLength > 0) readExact(input, contentLength) else ByteArray(0)
                 DiagnosticsLogger.log("INFO", "ApiServer", "$method $path bytes=$contentLength")
 
                 when {
-                    method == "GET" && path == "/health" -> writeJson(
-                        output,
-                        200,
-                        buildJsonObject {
-                            put("status", JsonPrimitive("ok"))
-                            put("model_loaded", JsonPrimitive(InferenceBridge.isLoaded()))
-                        },
-                    )
-                    method == "GET" && path == "/v1/models" -> writeJson(output, 200, modelsJson())
+                    method == "GET" && (path == "/v1/models" || path == "/models") -> writeJson(output, 200, modelsJson())
                     method == "POST" && path == "/v1/chat/completions" -> handleChat(output, body)
-                    else -> writeJson(output, 404, errorJson("not found"))
+                    method == "POST" && path == "/v1/completions" -> handleOpenAiCompletion(output, body)
+                    method == "POST" && path == "/completion" -> handleLlamaCompletion(output, body)
+                    else -> writeJson(output, 404, errorJson(404, "not found", "not_found_error"))
                 }
             } catch (e: Exception) {
                 DiagnosticsLogger.log("ERROR", "ApiServer", "request failed", e)
-                runCatching { writeJson(output, 500, errorJson(e.message ?: "internal error")) }
+                runCatching { writeJson(output, 500, errorJson(500, e.message ?: "internal error", "server_error")) }
             }
         }
     }
 
-    private fun handleChat(output: BufferedOutputStream, body: ByteArray) {
-        if (!InferenceBridge.isLoaded()) return writeJson(output, 503, errorJson("no model loaded"))
-        val root = runCatching { json.parseToJsonElement(body.toString(StandardCharsets.UTF_8)).jsonObject }
-            .getOrElse { return writeJson(output, 400, errorJson("invalid JSON")) }
-        if (root["stream"]?.jsonPrimitive?.booleanOrNull == true) {
-            return writeJson(output, 400, errorJson("streaming is not enabled in this Android server build"))
+    private fun writeHealth(output: BufferedOutputStream) {
+        if (InferenceBridge.isLoaded()) {
+            writeJson(
+                output,
+                200,
+                buildJsonObject {
+                    put("status", JsonPrimitive("ok"))
+                    put("model", JsonPrimitive(InferenceBridge.activeModelId ?: "loaded-model"))
+                    put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
+                },
+            )
+        } else {
+            writeJson(
+                output,
+                503,
+                errorJson(503, "No model loaded", "unavailable_error"),
+            )
         }
-        val messages = runCatching {
-            root["messages"]!!.jsonArray.map { entry ->
-                val obj = entry.jsonObject
-                val role = obj["role"]?.jsonPrimitive?.contentOrNull ?: "user"
-                val content = obj["content"]?.jsonPrimitive?.contentOrNull ?: ""
-                role to content
-            }
-        }.getOrElse { return writeJson(output, 400, errorJson("messages must be an array of text messages")) }
-        if (messages.isEmpty()) return writeJson(output, 400, errorJson("messages cannot be empty"))
+    }
 
-        val result = runBlocking { InferenceBridge.generateText(messages) }
+    private fun handleChat(output: BufferedOutputStream, body: ByteArray) {
+        if (!InferenceBridge.isLoaded()) {
+            return writeJson(output, 503, errorJson(503, "no model loaded", "unavailable_error"))
+        }
+        val root = parseJsonObject(body) ?: return writeJson(
+            output,
+            400,
+            errorJson(400, "invalid JSON", "invalid_request_error"),
+        )
+        val messages = parseMessages(root["messages"]) ?: return writeJson(
+            output,
+            400,
+            errorJson(400, "messages must be an array of text messages", "invalid_request_error"),
+        )
+        if (messages.isEmpty()) {
+            return writeJson(output, 400, errorJson(400, "messages cannot be empty", "invalid_request_error"))
+        }
+
+        val stream = root["stream"]?.jsonPrimitive?.booleanOrNull == true
+        val maxTokens = requestedMaxTokens(root)
+        val enableThinking = requestedThinking(root)
+        if (stream) {
+            handleChatStream(output, messages, maxTokens, enableThinking)
+        } else {
+            val result = runBlocking { InferenceBridge.generateText(messages, enableThinking, maxTokens) }
+            result.fold(
+                onSuccess = { response -> writeJson(output, 200, chatCompletionJson(response)) },
+                onFailure = {
+                    DiagnosticsLogger.log("ERROR", "ApiServer", "inference failed", it)
+                    writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error"))
+                },
+            )
+        }
+    }
+
+    private fun handleChatStream(
+        output: BufferedOutputStream,
+        messages: List<Pair<String, String>>,
+        maxTokens: Int,
+        enableThinking: Boolean,
+    ) {
+        val id = "chatcmpl-${UUID.randomUUID()}"
+        val model = InferenceBridge.activeModelId ?: "loaded-model"
+        val created = System.currentTimeMillis() / 1000L
+        writeSseHeaders(output)
+        writeSseData(output, chatChunkJson(id, model, created, role = "assistant"))
+
+        val result = runBlocking {
+            InferenceBridge.streamText(messages, enableThinking, maxTokens) { token ->
+                writeSseData(output, chatChunkJson(id, model, created, content = token))
+            }
+        }
         result.fold(
-            onSuccess = { response ->
-                val id = "chatcmpl-${UUID.randomUUID()}"
+            onSuccess = {
+                writeSseData(output, chatChunkJson(id, model, created, finishReason = "stop"))
+                writeSseDone(output)
+            },
+            onFailure = {
+                DiagnosticsLogger.log("ERROR", "ApiServer", "streaming inference failed", it)
+                writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                writeSseDone(output)
+            },
+        )
+    }
+
+    private fun handleOpenAiCompletion(output: BufferedOutputStream, body: ByteArray) {
+        if (!InferenceBridge.isLoaded()) {
+            return writeJson(output, 503, errorJson(503, "no model loaded", "unavailable_error"))
+        }
+        val root = parseJsonObject(body) ?: return writeJson(
+            output,
+            400,
+            errorJson(400, "invalid JSON", "invalid_request_error"),
+        )
+        val prompt = root["prompt"]?.jsonPrimitive?.contentOrNull
+            ?: return writeJson(output, 400, errorJson(400, "prompt must be a string", "invalid_request_error"))
+        val stream = root["stream"]?.jsonPrimitive?.booleanOrNull == true
+        val maxTokens = requestedMaxTokens(root)
+        val id = "cmpl-${UUID.randomUUID()}"
+        val model = InferenceBridge.activeModelId ?: "loaded-model"
+        val created = System.currentTimeMillis() / 1000L
+
+        if (stream) {
+            writeSseHeaders(output)
+            val result = runBlocking {
+                InferenceBridge.streamPrompt(prompt, maxTokens) { token ->
+                    writeSseData(output, completionChunkJson(id, model, created, token))
+                }
+            }
+            result.fold(
+                onSuccess = {
+                    writeSseData(output, completionChunkJson(id, model, created, "", finishReason = "stop"))
+                    writeSseDone(output)
+                },
+                onFailure = {
+                    writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                    writeSseDone(output)
+                },
+            )
+        } else {
+            val result = runBlocking { InferenceBridge.generatePrompt(prompt, maxTokens) }
+            result.fold(
+                onSuccess = { text ->
+                    writeJson(
+                        output,
+                        200,
+                        buildJsonObject {
+                            put("id", JsonPrimitive(id))
+                            put("object", JsonPrimitive("text_completion"))
+                            put("created", JsonPrimitive(created))
+                            put("model", JsonPrimitive(model))
+                            put(
+                                "choices",
+                                buildJsonArray {
+                                    add(
+                                        buildJsonObject {
+                                            put("text", JsonPrimitive(text))
+                                            put("index", JsonPrimitive(0))
+                                            put("finish_reason", JsonPrimitive("stop"))
+                                        },
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+                onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
+            )
+        }
+    }
+
+    private fun handleLlamaCompletion(output: BufferedOutputStream, body: ByteArray) {
+        if (!InferenceBridge.isLoaded()) {
+            return writeJson(output, 503, errorJson(503, "no model loaded", "unavailable_error"))
+        }
+        val root = parseJsonObject(body) ?: return writeJson(
+            output,
+            400,
+            errorJson(400, "invalid JSON", "invalid_request_error"),
+        )
+        val prompt = root["prompt"]?.jsonPrimitive?.contentOrNull
+            ?: return writeJson(output, 400, errorJson(400, "prompt must be a string", "invalid_request_error"))
+        val maxTokens = root["n_predict"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 } ?: requestedMaxTokens(root)
+        val result = runBlocking { InferenceBridge.generatePrompt(prompt, maxTokens) }
+        result.fold(
+            onSuccess = { text ->
                 writeJson(
                     output,
                     200,
                     buildJsonObject {
-                        put("id", JsonPrimitive(id))
-                        put("object", JsonPrimitive("chat.completion"))
+                        put("content", JsonPrimitive(text))
+                        put("stop", JsonPrimitive(true))
                         put("model", JsonPrimitive(InferenceBridge.activeModelId ?: "loaded-model"))
-                        put(
-                            "choices",
-                            buildJsonArray {
-                                add(
-                                    buildJsonObject {
-                                        put("index", JsonPrimitive(0))
-                                        put(
-                                            "message",
-                                            buildJsonObject {
-                                                put("role", JsonPrimitive("assistant"))
-                                                put("content", JsonPrimitive(response))
-                                            },
-                                        )
-                                        put("finish_reason", JsonPrimitive("stop"))
-                                    },
-                                )
-                            },
-                        )
                     },
                 )
             },
-            onFailure = {
-                DiagnosticsLogger.log("ERROR", "ApiServer", "inference failed", it)
-                writeJson(output, 500, errorJson(it.message ?: "inference failed"))
+            onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
+        )
+    }
+
+    private fun parseJsonObject(body: ByteArray): JsonObject? = runCatching {
+        json.parseToJsonElement(body.toString(StandardCharsets.UTF_8)).jsonObject
+    }.getOrNull()
+
+    private fun parseMessages(element: JsonElement?): List<Pair<String, String>>? = runCatching {
+        element!!.jsonArray.map { entry ->
+            val obj = entry.jsonObject
+            val role = obj["role"]?.jsonPrimitive?.contentOrNull ?: "user"
+            val content = extractTextContent(obj["content"])
+            role to content
+        }
+    }.getOrNull()
+
+    private fun extractTextContent(element: JsonElement?): String {
+        return when (element) {
+            is JsonPrimitive -> element.contentOrNull.orEmpty()
+            is JsonArray -> element.mapNotNull { part ->
+                runCatching {
+                    val obj = part.jsonObject
+                    if (obj["type"]?.jsonPrimitive?.contentOrNull == "text") {
+                        obj["text"]?.jsonPrimitive?.contentOrNull
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+            }.joinToString("\n")
+            else -> ""
+        }
+    }
+
+    private fun requestedMaxTokens(root: JsonObject): Int =
+        root["max_completion_tokens"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 }
+            ?: root["max_tokens"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 }
+            ?: DEFAULT_MAX_TOKENS
+
+    private fun requestedThinking(root: JsonObject): Boolean {
+        val direct = root["enable_thinking"]?.jsonPrimitive?.booleanOrNull
+        if (direct != null) return direct
+        return runCatching {
+            root["chat_template_kwargs"]?.jsonObject
+                ?.get("enable_thinking")?.jsonPrimitive?.booleanOrNull
+        }.getOrNull() ?: false
+    }
+
+    private fun chatCompletionJson(response: String): JsonObject = buildJsonObject {
+        put("id", JsonPrimitive("chatcmpl-${UUID.randomUUID()}"))
+        put("object", JsonPrimitive("chat.completion"))
+        put("created", JsonPrimitive(System.currentTimeMillis() / 1000L))
+        put("model", JsonPrimitive(InferenceBridge.activeModelId ?: "loaded-model"))
+        put(
+            "choices",
+            buildJsonArray {
+                add(
+                    buildJsonObject {
+                        put("index", JsonPrimitive(0))
+                        put(
+                            "message",
+                            buildJsonObject {
+                                put("role", JsonPrimitive("assistant"))
+                                put("content", JsonPrimitive(response))
+                            },
+                        )
+                        put("finish_reason", JsonPrimitive("stop"))
+                    },
+                )
+            },
+        )
+    }
+
+    private fun chatChunkJson(
+        id: String,
+        model: String,
+        created: Long,
+        role: String? = null,
+        content: String? = null,
+        finishReason: String? = null,
+    ): JsonObject = buildJsonObject {
+        put("id", JsonPrimitive(id))
+        put("object", JsonPrimitive("chat.completion.chunk"))
+        put("created", JsonPrimitive(created))
+        put("model", JsonPrimitive(model))
+        put(
+            "choices",
+            buildJsonArray {
+                add(
+                    buildJsonObject {
+                        put("index", JsonPrimitive(0))
+                        put(
+                            "delta",
+                            buildJsonObject {
+                                role?.let { put("role", JsonPrimitive(it)) }
+                                content?.let { put("content", JsonPrimitive(it)) }
+                            },
+                        )
+                        put("finish_reason", if (finishReason != null) JsonPrimitive(finishReason) else JsonNull)
+                    },
+                )
+            },
+        )
+    }
+
+    private fun completionChunkJson(
+        id: String,
+        model: String,
+        created: Long,
+        text: String,
+        finishReason: String? = null,
+    ): JsonObject = buildJsonObject {
+        put("id", JsonPrimitive(id))
+        put("object", JsonPrimitive("text_completion"))
+        put("created", JsonPrimitive(created))
+        put("model", JsonPrimitive(model))
+        put(
+            "choices",
+            buildJsonArray {
+                add(
+                    buildJsonObject {
+                        put("text", JsonPrimitive(text))
+                        put("index", JsonPrimitive(0))
+                        put("finish_reason", if (finishReason != null) JsonPrimitive(finishReason) else JsonNull)
+                    },
+                )
             },
         )
     }
@@ -209,7 +476,9 @@ object LocalApiServer {
                         buildJsonObject {
                             put("id", JsonPrimitive(id))
                             put("object", JsonPrimitive("model"))
-                            put("owned_by", JsonPrimitive("local"))
+                            put("owned_by", JsonPrimitive("geniex-local"))
+                            put("name", JsonPrimitive(InferenceBridge.activeModelName ?: id))
+                            put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
                         },
                     )
                 } ?: emptyList(),
@@ -222,33 +491,100 @@ object LocalApiServer {
         return headers["authorization"] == "Bearer $apiKey"
     }
 
-    private fun errorJson(message: String): JsonObject = buildJsonObject {
+    private fun errorJson(code: Int, message: String, type: String): JsonObject = buildJsonObject {
         put(
             "error",
             buildJsonObject {
+                put("code", JsonPrimitive(code))
                 put("message", JsonPrimitive(message))
-                put("type", JsonPrimitive("server_error"))
+                put("type", JsonPrimitive(type))
             },
         )
     }
 
-    private fun writeJson(output: BufferedOutputStream, code: Int, body: JsonObject) {
+    private fun writeJson(output: BufferedOutputStream, code: Int, body: JsonElement) {
         val bytes = body.toString().toByteArray(StandardCharsets.UTF_8)
-        val reason = when (code) {
-            200 -> "OK"
-            400 -> "Bad Request"
-            401 -> "Unauthorized"
-            404 -> "Not Found"
-            413 -> "Payload Too Large"
-            503 -> "Service Unavailable"
-            else -> "Internal Server Error"
+        writeResponse(output, code, "application/json; charset=utf-8", bytes)
+    }
+
+    private fun writeHtml(output: BufferedOutputStream, bytes: ByteArray) {
+        writeResponse(
+            output,
+            200,
+            "text/html; charset=utf-8",
+            bytes,
+            extraHeaders = listOf(
+                "Cache-Control: no-store",
+                "X-Content-Type-Options: nosniff",
+                "X-Frame-Options: DENY",
+                "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
+                "Referrer-Policy: no-referrer",
+            ),
+        )
+    }
+
+    private fun writeEmpty(output: BufferedOutputStream, code: Int) {
+        writeResponse(output, code, "text/plain", ByteArray(0))
+    }
+
+    private fun writeResponse(
+        output: BufferedOutputStream,
+        code: Int,
+        contentType: String,
+        body: ByteArray,
+        extraHeaders: List<String> = emptyList(),
+    ) {
+        output.write("HTTP/1.1 $code ${reasonPhrase(code)}\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("Content-Type: $contentType\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("Content-Length: ${body.size}\r\n".toByteArray(StandardCharsets.US_ASCII))
+        extraHeaders.forEach { header ->
+            output.write("$header\r\n".toByteArray(StandardCharsets.US_ASCII))
         }
-        output.write("HTTP/1.1 $code $reason\r\n".toByteArray(StandardCharsets.US_ASCII))
-        output.write("Content-Type: application/json; charset=utf-8\r\n".toByteArray(StandardCharsets.US_ASCII))
-        output.write("Content-Length: ${bytes.size}\r\n".toByteArray(StandardCharsets.US_ASCII))
         output.write("Connection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
-        output.write(bytes)
+        output.write(body)
         output.flush()
+    }
+
+    private fun writeSseHeaders(output: BufferedOutputStream) {
+        output.write("HTTP/1.1 200 OK\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("Content-Type: text/event-stream; charset=utf-8\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("Cache-Control: no-cache, no-transform\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("X-Accel-Buffering: no\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("Connection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.flush()
+    }
+
+    private fun writeSseData(output: BufferedOutputStream, body: JsonElement) {
+        val payload = "data: ${body}\n\n".toByteArray(StandardCharsets.UTF_8)
+        output.write(payload)
+        output.flush()
+    }
+
+    private fun writeSseDone(output: BufferedOutputStream) {
+        output.write("data: [DONE]\n\n".toByteArray(StandardCharsets.UTF_8))
+        output.flush()
+    }
+
+    private fun webUiBytes(): ByteArray {
+        cachedWebUi?.let { return it }
+        val context = appContext ?: return FALLBACK_WEB_UI.toByteArray(StandardCharsets.UTF_8)
+        return runCatching {
+            context.assets.open("web/index.html").use { it.readBytes() }
+        }.getOrElse {
+            DiagnosticsLogger.log("ERROR", "ApiServer", "web UI asset load failed", it)
+            FALLBACK_WEB_UI.toByteArray(StandardCharsets.UTF_8)
+        }.also { cachedWebUi = it }
+    }
+
+    private fun reasonPhrase(code: Int): String = when (code) {
+        200 -> "OK"
+        204 -> "No Content"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        404 -> "Not Found"
+        413 -> "Payload Too Large"
+        503 -> "Service Unavailable"
+        else -> "Internal Server Error"
     }
 
     private fun readLine(input: BufferedInputStream): String? {
@@ -289,4 +625,6 @@ object LocalApiServer {
         }
         null
     }.getOrNull()
+
+    private const val FALLBACK_WEB_UI = """<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>GenieX Local</title></head><body><h1>GenieX Local</h1><p>The bundled web chat UI could not be loaded. The API remains available at <code>/v1</code>.</p></body></html>"""
 }
