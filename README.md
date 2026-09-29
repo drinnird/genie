@@ -21,9 +21,7 @@ The app is located at:
 
 `apps/geniex_chat_android`
 
-The only repository-level shared build file required by the app is:
-
-`apps/_shared/scripts/versions.env`
+The Android project is fully standalone; it no longer depends on Qualcomm's repository-level `_shared` build scripts or `versions.env`.
 
 ## Uploading to GitHub
 

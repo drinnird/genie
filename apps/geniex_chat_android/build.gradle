@@ -4,20 +4,16 @@ plugins {
     id 'org.jetbrains.kotlin.plugin.serialization' version '2.2.0'
 }
 
-// Load shared versions and utilities — must be before android {} and dependencies {}
-if (file('_shared/android/common.gradle').exists()) {
-    apply from: '_shared/android/common.gradle'
-}
 
 android {
     namespace 'com.geniex.demo'
-    ndkVersion ANDROID_NDK_VERSION
-    compileSdk ANDROID_COMPILE_API
+    ndkVersion '27.3.13750724'
+    compileSdk 34
 
     defaultConfig {
         applicationId 'com.geniex.demo'
-        minSdk ANDROID_MIN_API
-        targetSdk ANDROID_TARGET_API
+        minSdk 31
+        targetSdk 34
         versionCode 1
         versionName '1.0'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'

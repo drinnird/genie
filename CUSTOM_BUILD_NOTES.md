@@ -56,3 +56,11 @@ The current execution environment does not contain Gradle or an Android SDK and 
 ## Runtime note
 
 The Q4* => NPU eligibility is the requested product policy. Qualcomm's current documentation specifically identifies Q4_0 as the GGUF precision with best Hexagon NPU support; K-quants such as Q4_K_M are documented as typically GPU/CPU. For that reason the app records the requested backend and exports SDK/runtime diagnostics so actual behavior can be verified on-device.
+
+
+## Standalone build fix
+
+The project no longer imports `apps/_shared/scripts/versions.env` or
+`_shared/android/common.gradle`. Android SDK/NDK versions are pinned directly
+in `apps/geniex_chat_android/build.gradle`, preventing missing shared-file
+failures in minimal GitHub repositories.

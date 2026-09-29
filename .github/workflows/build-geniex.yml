@@ -21,6 +21,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify standalone project layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f apps/geniex_chat_android/build.gradle
+          test -f apps/geniex_chat_android/settings.gradle
+          test -f apps/geniex_chat_android/src/main/AndroidManifest.xml
+          if grep -R --line-number -E 'apps/_shared|_shared/android/common.gradle|ANDROID_(COMPILE|MIN|TARGET)_API|ANDROID_NDK_VERSION' \
+              apps/geniex_chat_android/build.gradle; then
+            echo "Unexpected shared-build dependency remains in build.gradle."
+            exit 1
+          fi
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
