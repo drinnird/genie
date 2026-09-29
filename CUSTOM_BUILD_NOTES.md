@@ -64,3 +64,8 @@ The project no longer imports `apps/_shared/scripts/versions.env` or
 `_shared/android/common.gradle`. Android SDK/NDK versions are pinned directly
 in `apps/geniex_chat_android/build.gradle`, preventing missing shared-file
 failures in minimal GitHub repositories.
+
+
+## Lint manifest fix
+
+Declared camera hardware as optional (`android.hardware.camera`, `required=false`) so the CAMERA permission does not imply a required hardware feature. Removed the redundant `android:extractNativeLibs` manifest attribute; legacy JNI packaging remains enabled through Gradle (`packaging { jniLibs.useLegacyPackaging = true }`).
