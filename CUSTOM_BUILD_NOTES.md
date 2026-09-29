@@ -120,3 +120,8 @@ Static audit for this revision:
 - responsive control-state invariants verified in `MainActivity`
 
 A full Android Gradle build still runs in GitHub Actions (`lintDebug` + `assembleDebug`) before any APK release is published.
+
+
+## UI v6 resource-link fix
+
+Removed unsupported `insetTop`/`insetBottom` style items from the custom Material button styles. These were causing `processDebugResources` to fail before Kotlin compilation. Button sizing remains controlled by `android:minHeight`, layout margins, and Material button padding.
