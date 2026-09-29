@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:text="Compute unit"
+        android:textStyle="bold" />
+
+    <RadioGroup
+        android:id="@+id/rg_select_plugin_id"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <RadioButton
+            android:id="@+id/rb_npu"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="NPU — Hexagon acceleration"
+            android:visibility="gone" />
+
+        <RadioButton
+            android:id="@+id/rb_gpu"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="GPU — Adreno OpenCL"
+            android:visibility="gone"
+            tools:visibility="visible" />
+
+        <RadioButton
+            android:id="@+id/rb_cpu"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="CPU — ARM64"
+            android:visibility="gone"
+            tools:visibility="visible" />
+    </RadioGroup>
+
+    <!-- Retained for generated view-binding compatibility; advanced manual
+         layer tuning is intentionally hidden in this fork. -->
+    <LinearLayout
+        android:id="@+id/ll_gpu_layers"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="GPU layers" />
+
+        <EditText
+            android:id="@+id/et_gpu_layers"
+            android:layout_width="60dp"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:text="999" />
+    </LinearLayout>
+</LinearLayout>

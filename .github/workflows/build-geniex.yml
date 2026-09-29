@@ -1,0 +1,161 @@
+name: Build and Release GenieX Android
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: geniex-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+            if [[ -z "$SDK_ROOT" ]]; then
+              echo "Neither ANDROID_HOME nor ANDROID_SDK_ROOT is set."
+              exit 1
+            fi
+            SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            echo "sdkmanager was not found on the runner."
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            'platform-tools' \
+            'platforms;android-34' \
+            'build-tools;35.0.0' \
+            'ndk;27.3.13750724'
+
+      - name: Set unique Android version
+        id: version
+        shell: bash
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          VERSION_CODE=$((10#$RUN_NUMBER * 1000 + 10#$RUN_ATTEMPT))
+          VERSION_NAME="0.37.2-custom.${RUN_NUMBER}.${RUN_ATTEMPT}"
+          RELEASE_TAG="geniex-v${VERSION_NAME}"
+          APK_NAME="GenieX-Chat-v${VERSION_NAME}.apk"
+
+          if (( VERSION_CODE > 2100000000 )); then
+            echo "Generated versionCode is too large."
+            exit 1
+          fi
+
+          python3 - "$VERSION_CODE" "$VERSION_NAME" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path("apps/geniex_chat_android/build.gradle")
+          text = path.read_text()
+          text, code_count = re.subn(
+              r"^(\s*)versionCode\s+\d+\s*$",
+              lambda m: f"{m.group(1)}versionCode {sys.argv[1]}",
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          text, name_count = re.subn(
+              r"^(\s*)versionName\s+['\"][^'\"]*['\"]\s*$",
+              lambda m: f"{m.group(1)}versionName '{sys.argv[2]}'",
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if code_count != 1 or name_count != 1:
+              raise SystemExit(
+                  f"version patch failed: versionCode={code_count}, versionName={name_count}"
+              )
+          path.write_text(text)
+          PY
+
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Audit and build
+        working-directory: apps/geniex_chat_android
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon lintDebug assembleDebug --stacktrace
+
+      - name: Prepare APK
+        id: apk
+        shell: bash
+        env:
+          APK_NAME: ${{ steps.version.outputs.apk_name }}
+        run: |
+          set -euo pipefail
+          SOURCE_APK="apps/geniex_chat_android/build/outputs/apk/debug/app-debug.apk"
+          test -f "$SOURCE_APK"
+          cp "$SOURCE_APK" "$APK_NAME"
+          SHA256="$(sha256sum "$APK_NAME" | awk '{print $1}')"
+          echo "path=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK_NAME"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_SHA256: ${{ steps.apk.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<NOTES
+          Automated GenieX Android build.
+
+          Source base: Qualcomm AI Hub Apps v0.37.2
+          Android versionName: ${VERSION_NAME}
+          Android versionCode: ${VERSION_CODE}
+          Workflow run: ${GITHUB_RUN_NUMBER}
+          Attempt: ${GITHUB_RUN_ATTEMPT}
+          Commit: ${GITHUB_SHA}
+          APK SHA-256: ${APK_SHA256}
+          NOTES
+
+          gh release create "$RELEASE_TAG" \
+            "$APK_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GenieX Chat v${VERSION_NAME}" \
+            --notes-file release-notes.md \
+            --latest
