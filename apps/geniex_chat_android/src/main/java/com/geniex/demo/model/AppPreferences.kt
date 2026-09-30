@@ -5,6 +5,8 @@ import android.content.Context
 object AppPreferences {
     private const val PREFS = "geniex_custom"
     private const val KEY_SELECTED_MODEL = "selected_model"
+    private const val KEY_LAST_LOADED_MODEL = "last_loaded_model"
+    private const val KEY_LAST_LOADED_COMPUTE = "last_loaded_compute"
     private const val KEY_SERVER_PORT = "server_port"
     private const val KEY_SERVER_LAN = "server_lan"
     private const val KEY_SERVER_KEY = "server_key"
@@ -17,6 +19,38 @@ object AppPreferences {
 
     fun setSelectedModelId(context: Context, id: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SELECTED_MODEL, id).apply()
+    }
+
+
+    data class LastLoadedModel(val modelId: String, val computeUnit: String)
+
+    /**
+     * Persist only a model that finished native creation successfully. This is
+     * intentionally separate from the currently selected catalog row: browsing
+     * the Models screen must not change what is restored on the next startup.
+     */
+    fun rememberSuccessfulModelLoad(context: Context, modelId: String, computeUnit: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_SELECTED_MODEL, modelId)
+            .putString(KEY_LAST_LOADED_MODEL, modelId)
+            .putString(KEY_LAST_LOADED_COMPUTE, computeUnit)
+            .commit()
+    }
+
+    fun getLastLoadedModel(context: Context): LastLoadedModel? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val modelId = prefs.getString(KEY_LAST_LOADED_MODEL, null)?.takeIf { it.isNotBlank() } ?: return null
+        val compute = prefs.getString(KEY_LAST_LOADED_COMPUTE, null)?.takeIf { it.isNotBlank() } ?: return null
+        return LastLoadedModel(modelId, compute)
+    }
+
+    fun clearLastLoadedModelIfMatches(context: Context, modelId: String) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.getString(KEY_LAST_LOADED_MODEL, null) != modelId) return
+        prefs.edit()
+            .remove(KEY_LAST_LOADED_MODEL)
+            .remove(KEY_LAST_LOADED_COMPUTE)
+            .commit()
     }
 
     data class PendingModelLoad(val modelId: String, val computeUnit: String)

@@ -2,6 +2,7 @@ package com.geniex.demo.server
 
 import android.content.Context
 import android.os.SystemClock
+import com.geniex.demo.ChatRolePolicy
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.documents.DocumentProcessor
 import kotlinx.coroutines.runBlocking
@@ -271,6 +272,10 @@ object LocalApiServer {
         if (messages.isEmpty()) {
             return writeJson(output, 400, errorJson(400, "messages cannot be empty", "invalid_request_error"))
         }
+        val normalizedMessages = messages.map { (role, content) -> ChatRolePolicy.normalize(role) to content }
+        ChatRolePolicy.validateForGeneration(normalizedMessages.map { it.first })?.let { roleError ->
+            return writeJson(output, 400, errorJson(400, roleError, "invalid_request_error"))
+        }
 
         val stream = root["stream"]?.jsonPrimitive?.booleanOrNull == true
         val maxTokens = requestedMaxTokens(root)
@@ -278,9 +283,9 @@ object LocalApiServer {
         if (!acquireInferenceSlot(output, "/v1/chat/completions")) return
         try {
             if (stream) {
-                handleChatStream(output, messages, maxTokens, enableThinking)
+                handleChatStream(output, normalizedMessages, maxTokens, enableThinking)
             } else {
-                val result = runBlocking { InferenceBridge.generateText(messages, enableThinking, maxTokens) }
+                val result = runBlocking { InferenceBridge.generateText(normalizedMessages, enableThinking, maxTokens) }
                 result.fold(
                     onSuccess = { response -> writeJson(output, 200, chatCompletionJson(response)) },
                     onFailure = {
@@ -796,10 +801,12 @@ object LocalApiServer {
     }
 
     private fun inferenceErrorStatus(error: Throwable): Triple<Int, String, String> =
-        if (error is InferenceBridge.ContextLengthException) {
-            Triple(400, error.message ?: "context length exceeded", "context_length_exceeded")
-        } else {
-            Triple(500, error.message ?: "inference failed", "server_error")
+        when (error) {
+            is InferenceBridge.ContextLengthException ->
+                Triple(400, error.message ?: "context length exceeded", "context_length_exceeded")
+            is InferenceBridge.InvalidChatSequenceException ->
+                Triple(400, error.message ?: "invalid chat message sequence", "invalid_request_error")
+            else -> Triple(500, error.message ?: "inference failed", "server_error")
         }
 
     private fun writeInferenceError(output: BufferedOutputStream, error: Throwable) {
