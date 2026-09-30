@@ -331,3 +331,9 @@ refresh helpers.
 - A completed bundle records the target chipset. A bundle copied from an incompatible chipset is not offered for loading, but its persistent files remain visible to the delete path so the user can explicitly remove and replace it.
 - QAIRT memory preflight measures the whole extracted bundle directory instead of only its small tokenizer/metadata anchor file.
 - Non-NPU-optimized downloads retain their v21 behavior.
+
+## v22.1 build-log fixes (2026-09-30)
+
+- Removed the obsolete `GenerationConfig.nPast` argument after the GenieX Android 0.4.0 migration. `GenerationConfig` no longer exposes that field.
+- Made `ModelDownloadCoordinator.hasPersistentDownloadFiles(...)` suspend-aware because GenieX 0.4.0 exposes `ModelManagerWrapper.getPaths(...)` as a suspend function. Its only UI caller already executes inside the activity coroutine scope.
+- These fixes address the two `compileDebugKotlin` errors reported by GitHub Actions run logs uploaded on 2026-09-30.

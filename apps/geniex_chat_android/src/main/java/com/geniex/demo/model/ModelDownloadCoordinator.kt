@@ -82,7 +82,7 @@ object ModelDownloadCoordinator {
     fun usesPersistentDirectDownload(model: ModelData): Boolean =
         usesStandardHuggingFaceDownload(model) || usesQualcommHfQairtDownload(model)
 
-    fun hasPersistentDownloadFiles(context: Context, model: ModelData): Boolean {
+    suspend fun hasPersistentDownloadFiles(context: Context, model: ModelData): Boolean {
         if (!usesPersistentDirectDownload(model)) return false
         val dir = if (usesQualcommHfQairtDownload(model)) {
             QairtBundleStore.directory(context, model)
