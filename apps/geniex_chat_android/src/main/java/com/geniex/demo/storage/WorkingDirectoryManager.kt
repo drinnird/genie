@@ -35,6 +35,10 @@ object WorkingDirectoryManager {
         val logs: File,
         val diagnostics: File,
         val attachments: File,
+        val documents: File,
+        val documentSources: File,
+        val documentJobs: File,
+        val documentSummaries: File,
         val temp: File,
     )
 
@@ -175,6 +179,10 @@ object WorkingDirectoryManager {
             workspace.logs,
             workspace.diagnostics,
             workspace.attachments,
+            workspace.documents,
+            workspace.documentSources,
+            workspace.documentJobs,
+            workspace.documentSummaries,
             workspace.temp,
         ).forEach { dir ->
             if (!dir.exists() && !dir.mkdirs()) error("Could not create ${dir.absolutePath}")
@@ -202,6 +210,7 @@ object WorkingDirectoryManager {
                             "logs/        app, model-loader, memory, native-runtime and API logs\n" +
                             "diagnostics/ exported diagnostic ZIP files\n" +
                             "attachments/ persistent chat image copies\n" +
+                            "documents/   transcript sources, processing jobs, and saved lecture notes\n" +
                             "temp/        temporary app files\n\n" +
                             "Keep this Genie folder across app reinstalls. After reinstalling, select its parent (or the Genie folder itself) again.\n",
                     )
@@ -218,6 +227,10 @@ object WorkingDirectoryManager {
         logs = File(root, "logs"),
         diagnostics = File(root, "diagnostics"),
         attachments = File(root, "attachments"),
+        documents = File(root, "documents"),
+        documentSources = File(root, "documents/sources"),
+        documentJobs = File(root, "documents/jobs"),
+        documentSummaries = File(root, "documents/summaries"),
         temp = File(root, "temp"),
     )
 

@@ -54,9 +54,39 @@ object PerformanceTuning {
     const val MAX_UI_CHARS = 160_000
     const val MAX_API_MESSAGES = 48
     const val MAX_API_HISTORY_CHARS = 64_000
-    const val MAX_API_RESPONSE_TOKENS = 4096
 
-    private const val LLAMA_CONTEXT_TOKENS = 1024
+    // Generation/context policy. The loaded llama.cpp context is deliberately
+    // conservative for phone memory, so output must be budgeted against the
+    // prompt instead of blindly requesting a context-sized response.
+    const val LLAMA_CONTEXT_TOKENS = 1024
+    const val QAIRT_CONTEXT_BUDGET_TOKENS = 2048
+    const val DEFAULT_RESPONSE_TOKENS = 512
+    const val MAX_API_RESPONSE_TOKENS = 2048
+    const val MIN_RESPONSE_TOKENS = 48
+    const val CONTEXT_SAFETY_TOKENS = 96
+
+    // Conservative tokenizer-independent estimate. Qwen/llama tokenization
+    // varies by language/content; assuming only two UTF-16 chars per token
+    // intentionally overestimates ordinary English prompts and leaves headroom.
+    private const val APPROX_CHARS_PER_TOKEN = 2
+
+    fun estimatePromptTokens(text: String): Int =
+        ((text.length + APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN).coerceAtLeast(1)
+
+    fun responseBudget(
+        formattedPrompt: String,
+        contextWindowTokens: Int,
+        requestedTokens: Int,
+    ): Int {
+        val context = contextWindowTokens.coerceAtLeast(256)
+        val promptTokens = estimatePromptTokens(formattedPrompt)
+        val available = context - promptTokens - CONTEXT_SAFETY_TOKENS
+        return minOf(
+            requestedTokens.coerceIn(1, MAX_API_RESPONSE_TOKENS),
+            available.coerceAtLeast(0),
+        )
+    }
+
     private const val GIB = 1024L * 1024L * 1024L
     private const val LOW_MEMORY_BATCH_THRESHOLD_BYTES = 4L * GIB
 }

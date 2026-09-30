@@ -43,7 +43,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="Download, manage, and choose your on-device model"
+                android:text="Download, load, and manage your on-device models"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
         </LinearLayout>

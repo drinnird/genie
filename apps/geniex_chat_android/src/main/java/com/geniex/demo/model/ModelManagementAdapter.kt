@@ -13,6 +13,7 @@ data class ModelUiState(
     val available: Boolean = false,
     val selected: Boolean = false,
     val loaded: Boolean = false,
+    val blockedByActiveModel: Boolean = false,
     val downloading: Boolean = false,
     val progress: Int? = null,
     val error: String? = null,
@@ -55,21 +56,23 @@ class ModelManagementAdapter(
                 state.error != null -> "Download failed"
                 state.downloading -> state.progress?.let { "Downloading • $it%" } ?: "Downloading"
                 state.loaded -> "Active"
-                state.selected && state.available -> "Selected • Available"
-                state.available -> "Available"
+                state.available && state.blockedByActiveModel -> "Available • unload active model to switch"
+                state.available -> "Available • ready to load"
                 else -> "Not downloaded"
             }
 
+            // Keep the action surface unambiguous: a model that is already on
+            // disk never shows Download, while a missing model never shows Load.
+            binding.btnModelDownload.visibility =
+                if (!state.available || state.downloading) android.view.View.VISIBLE else android.view.View.GONE
             binding.btnModelDownload.isEnabled = !state.available && !state.downloading
             binding.btnModelDownload.text = if (state.downloading) "Downloading" else "Download"
             binding.btnModelDownload.setOnClickListener { onDownload(model) }
 
-            binding.btnModelUse.isEnabled = state.available && !state.downloading
-            binding.btnModelUse.text = when {
-                state.loaded -> "Active"
-                state.selected -> "Selected"
-                else -> "Select"
-            }
+            binding.btnModelUse.visibility =
+                if (state.available && !state.downloading) android.view.View.VISIBLE else android.view.View.GONE
+            binding.btnModelUse.isEnabled = state.available && !state.downloading && !state.blockedByActiveModel
+            binding.btnModelUse.text = if (state.loaded) "Unload" else "Load"
             binding.btnModelUse.setOnClickListener { onUse(model) }
 
             // Do not show destructive controls for models that do not exist

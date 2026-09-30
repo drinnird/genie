@@ -94,6 +94,7 @@ class ModelManagementActivity : FragmentActivity() {
                     available = available,
                     selected = model.id == selectedId,
                     loaded = model.id == activeId,
+                    blockedByActiveModel = activeId != null && activeId != model.id,
                     downloading = old?.downloading == true,
                     progress = old?.progress,
                     error = old?.error,
@@ -165,9 +166,19 @@ class ModelManagementActivity : FragmentActivity() {
     }
 
     private fun selectModel(model: ModelData) {
+        val activeId = InferenceBridge.activeModelId
+        val action = if (activeId == model.id) ACTION_UNLOAD else ACTION_LOAD
+        if (activeId != null && activeId != model.id) {
+            Toast.makeText(this, "Unload the active model before loading another one.", Toast.LENGTH_SHORT).show()
+            return
+        }
         AppPreferences.setSelectedModelId(this, model.id)
-        setResult(Activity.RESULT_OK, Intent().putExtra(EXTRA_SELECTED_MODEL_ID, model.id))
-        Toast.makeText(this, "Selected ${model.displayName}", Toast.LENGTH_SHORT).show()
+        setResult(
+            Activity.RESULT_OK,
+            Intent()
+                .putExtra(EXTRA_SELECTED_MODEL_ID, model.id)
+                .putExtra(EXTRA_MODEL_ACTION, action),
+        )
         finish()
     }
 
@@ -221,5 +232,8 @@ class ModelManagementActivity : FragmentActivity() {
 
     companion object {
         const val EXTRA_SELECTED_MODEL_ID = "selected_model_id"
+        const val EXTRA_MODEL_ACTION = "model_action"
+        const val ACTION_LOAD = "load"
+        const val ACTION_UNLOAD = "unload"
     }
 }

@@ -9,7 +9,7 @@ import com.geniex.sdk.bean.GenerationConfig
 // Configuration sample for generation with defaults compatible with bridge
 // maxTokens: 0 = no limit, generates until model's natural stopping point
 data class GenerationConfigSample(
-    var maxTokens: Int = 2048,
+    var maxTokens: Int = PerformanceTuning.DEFAULT_RESPONSE_TOKENS,
     var stopWords: List<String>? = null,
     var stopCount: Int = 0,
     var nPast: Int = 0,

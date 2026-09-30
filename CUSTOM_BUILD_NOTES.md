@@ -237,3 +237,38 @@ before `MainActivity.initView()` had initialized `tvSelectedModel` and other vie
 This produced `UninitializedPropertyAccessException` immediately after workspace setup.
 The UI is now initialized before the SDK, and asynchronous UI refresh entry points are
 guarded until view binding is complete.
+
+
+## v15 web auth and context-budget fixes
+
+- Browser chat now detects when the server requires authentication and disables Send until an API key is entered.
+- Missing Authorization headers return a clear `API key required` response instead of a generic timeout/rejection path.
+- Browser requests default to 512 output tokens instead of requesting an entire 1024-token llama context.
+- InferenceBridge tracks the loaded model's context budget, estimates prompt usage conservatively, reserves safety headroom, and caps output to what remains.
+- Old chat turns are dropped automatically when needed to make room for the current prompt and response. The newest user message is never silently dropped.
+- Raw completion prompts are tail-trimmed only when necessary to reserve a minimum response budget.
+- Context-length failures now return a specific `context_length_exceeded` API error with actionable text.
+- Native Android chat uses the same safe output-budget calculation.
+
+## v16 transcript attachments and lecture summarization
+
+- Android chat can attach multiple `.txt` transcript files in one selection.
+- Attached files are copied with bounded streaming I/O into `Genie/documents/sources/`.
+- Lecture Notes mode processes every attached file in selected order as one lecture, preserves file boundaries, summarizes bounded chunks, consolidates them hierarchically, and saves Markdown notes under `Genie/documents/summaries/`.
+- If the Android message box is blank in Lecture Notes mode, the built-in lecture-summary prompt is used. A typed prompt overrides the preset.
+- After a summary completes, the attachment mode switches to Ask Files. Questions use bounded local lexical retrieval so only relevant transcript excerpts are sent to the model.
+- The web chat now supports multiple TXT uploads, Lecture Notes / Ask Files modes, progress reporting, and Stop during document processing.
+- Web uploads use `POST /v1/files` and are streamed directly to disk with a 64 MB per-file limit rather than loaded into one Android heap buffer.
+- New document API endpoints: `GET/POST /v1/files`, `POST /v1/documents/summarize`, and `POST /v1/documents/query`.
+- Intermediate summary jobs are stored under `Genie/documents/jobs/` and cleaned after successful completion; stale jobs older than 24 hours are cleaned automatically.
+- Document processing is globally serialized with native chat/API inference to avoid racing the same GenieX model handle.
+
+## v17 compact header and model actions
+
+- Removed the large selected-model control card from the chat screen.
+- Added a compact GenieX header with the selected model and active compute unit directly below the title.
+- Added a right-aligned gear menu with Manage models, Web server, and Diagnostics.
+- Moved Stop next to the message composer so it remains available only while generation is active.
+- Model cards now show Download only when a model is absent, Load when it is downloaded, and Unload when it is active.
+- Loading from the Models screen now returns directly to chat and starts the existing backend-selection/load flow; it no longer merely updates a selection preference.
+- When another model is active, other model Load buttons are disabled with an explicit unload-first status to preserve the clean-process switching protections.

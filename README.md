@@ -61,3 +61,16 @@ the current GenieX native model manager consumes ordinary filesystem paths via
 not directly usable by that native path-based cache. Workspace setup is now
 recovery-safe: a stale or invalid saved path will return to the setup screen
 instead of crash-looping the application.
+
+
+## v15 web authentication and context management
+
+The browser chat now prompts clearly for the Android server API key before sending authenticated requests. Chat/completion output is context-budgeted: the app reserves context headroom, caps response length to available space, and drops the oldest chat turns when necessary while preserving the latest user prompt.
+
+### Transcript files
+
+The custom Android and browser chat UIs support multiple `.txt` lecture transcripts. Choose **Lecture notes** to process all attached files in order as one lecture, or **Ask files** to answer questions from relevant transcript excerpts. Large files are streamed and chunked; they are not appended wholesale to the model context. Generated notes are saved in `Genie/documents/summaries/`.
+
+### Compact chat navigation
+
+The chat header shows the selected model and active compute backend. Use the gear button in the top-right for Models, Web server, and Diagnostics. Downloaded model cards expose **Load** rather than **Download**; the active model exposes **Unload**.

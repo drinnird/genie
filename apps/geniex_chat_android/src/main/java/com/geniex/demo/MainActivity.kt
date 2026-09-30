@@ -34,6 +34,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
+import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.SimpleAdapter
 import android.widget.Spinner
@@ -54,6 +55,7 @@ import com.geniex.demo.databinding.DialogSelectPluginIdBinding
 import com.geniex.demo.listeners.CustomDialogInterface
 import com.geniex.demo.diagnostics.DiagnosticsActivity
 import com.geniex.demo.diagnostics.DiagnosticsLogger
+import com.geniex.demo.documents.DocumentProcessor
 import com.geniex.demo.model.AppPreferences
 import com.geniex.demo.model.ModelManagementActivity
 import com.geniex.demo.server.InferenceBridge
@@ -98,6 +100,7 @@ class MainActivity : FragmentActivity() {
     private val binding: ActivityMainBinding by inflate()
     private var downloadJob: Job? = null
     private var modelLoadJob: Job? = null
+    private var documentJob: Job? = null
     private var downloadingModelData: ModelData? = null
     private lateinit var llDownloading: LinearLayout
     private lateinit var tvDownloadProgress: TextView
@@ -111,6 +114,12 @@ class MainActivity : FragmentActivity() {
     private lateinit var btnSend: Button
     private lateinit var btnClearHistory: Button
     private lateinit var btnAddImage: Button
+    private lateinit var btnAttachText: Button
+    private lateinit var btnDocumentMode: Button
+    private lateinit var btnClearDocuments: Button
+    private lateinit var llDocuments: LinearLayout
+    private lateinit var tvAttachedDocuments: TextView
+    private lateinit var tvDocumentStatus: TextView
     private lateinit var tvSelectedModel: TextView
     private lateinit var tvSelectedModelStatus: TextView
     private lateinit var tvServerStatusCompact: TextView
@@ -119,6 +128,7 @@ class MainActivity : FragmentActivity() {
     private lateinit var btnDiagnostics: Button
     private lateinit var btnModelPanelToggle: Button
     private lateinit var llModelPanelContent: LinearLayout
+    private lateinit var btnSettingsMenu: View
 
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: ChatAdapter
@@ -151,6 +161,9 @@ class MainActivity : FragmentActivity() {
     private var isGenerating = false
 
     private val savedImageFiles = mutableListOf<File>()
+    private val selectedDocuments = mutableListOf<DocumentProcessor.DocumentRef>()
+    private var documentLectureMode = true
+    @Volatile private var documentStopRequested = false
     private val messages = arrayListOf<Message>()
     private var loadingMessageIndex: Int = -1
     private var streamingMessageIndex: Int = -1
@@ -249,6 +262,13 @@ class MainActivity : FragmentActivity() {
         btnStop = findViewById(R.id.btn_stop)
         etInput = findViewById(R.id.et_input)
         btnAddImage = findViewById(R.id.btn_add_image)
+        btnAttachText = findViewById(R.id.btn_attach_text)
+        btnDocumentMode = findViewById(R.id.btn_document_mode)
+        btnClearDocuments = findViewById(R.id.btn_clear_documents)
+        llDocuments = findViewById(R.id.ll_documents)
+        tvAttachedDocuments = findViewById(R.id.tv_attached_documents)
+        tvDocumentStatus = findViewById(R.id.tv_document_status)
+        refreshDocumentUi()
         tvSelectedModel = findViewById(R.id.tv_selected_model)
         tvSelectedModelStatus = findViewById(R.id.tv_selected_model_status)
         tvServerStatusCompact = findViewById(R.id.tv_server_status_compact)
@@ -257,8 +277,11 @@ class MainActivity : FragmentActivity() {
         btnDiagnostics = findViewById(R.id.btn_diagnostics)
         btnModelPanelToggle = findViewById(R.id.btn_model_panel_toggle)
         llModelPanelContent = findViewById(R.id.ll_model_panel_content)
-        btnModelPanelToggle.setOnClickListener { toggleModelPanel() }
-        applyModelPanelCollapsedState()
+        btnSettingsMenu = findViewById(R.id.btn_settings_menu)
+        // The former model-control card is intentionally gone. Keep the hidden
+        // compatibility controls for the existing load/unload implementation,
+        // while all navigation is surfaced through the gear menu.
+        llModelPanelContent.visibility = View.GONE
 
         btnSend = findViewById(R.id.btn_send)
         btnSend.isEnabled = false
@@ -348,16 +371,18 @@ class MainActivity : FragmentActivity() {
             runOnUiThread {
                 val active = InferenceBridge.activeModelId == model.id
                 val anyModelLoaded = hasLoadedModel()
-                btnLoadModel.visibility = if (anyModelLoaded) View.GONE else View.VISIBLE
+                // These controls are hidden compatibility actions now; the Models
+                // screen is the visible load/unload surface.
+                btnLoadModel.visibility = View.GONE
                 btnLoadModel.isEnabled = available && !anyModelLoaded
                 btnLoadModel.text = if (available) "Load model" else "Download in Models"
-                btnUnloadModel.visibility = if (anyModelLoaded) View.VISIBLE else View.GONE
+                btnUnloadModel.visibility = View.GONE
                 btnStop.visibility = if (anyModelLoaded && isGenerating) View.VISIBLE else View.GONE
                 tvSelectedModelStatus.text = when {
-                    active -> "Active • ${model.quant ?: model.runtime.orEmpty()} • ${InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary}"
-                    anyModelLoaded -> "Selected • ${model.quant ?: model.runtime.orEmpty()} • unload the active model to switch"
-                    available -> "Available • ${model.quant ?: model.runtime.orEmpty()} • ${model.computeSummary}"
-                    else -> "Not downloaded • ${model.quant ?: model.runtime.orEmpty()} • ${model.computeSummary}"
+                    active -> "Active • ${InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary}"
+                    anyModelLoaded -> "Not active • unload the active model to switch"
+                    available -> "Ready to load • ${model.computeSummary}"
+                    else -> "Not downloaded • ${model.computeSummary}"
                 }
             }
         }
@@ -503,8 +528,12 @@ class MainActivity : FragmentActivity() {
     private fun refreshSendButtonState() {
         runOnUiThread {
             val hasText = etInput.text?.isNotBlank() == true
-            val hasAttachment = savedImageFiles.isNotEmpty()
-            btnSend.isEnabled = hasLoadedModel() && !isGenerating && (hasText || hasAttachment)
+            val hasImageAttachment = savedImageFiles.isNotEmpty()
+            val hasDocuments = selectedDocuments.isNotEmpty()
+            val documentReady = hasDocuments && (documentLectureMode || hasText)
+            btnSend.isEnabled =
+                hasLoadedModel() && !isGenerating && !DocumentProcessor.isProcessing() &&
+                    (hasText || hasImageAttachment || documentReady)
             btnStop.visibility = if (hasLoadedModel() && isGenerating) View.VISIBLE else View.GONE
         }
     }
@@ -754,7 +783,13 @@ class MainActivity : FragmentActivity() {
                             DiagnosticsLogger.modelLoadStage("LLM_BUILD_RETURNED_SUCCESS")
                             isLoadLlmModel = true
                             llmWrapper = wrapper
-                            InferenceBridge.setLlm(wrapper, selectModelData.id, selectModelData.displayName, requestedCompute)
+                            InferenceBridge.setLlm(
+                                wrapper,
+                                selectModelData.id,
+                                selectModelData.displayName,
+                                requestedCompute,
+                                if (isQairt) PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS else llamaTuning!!.nCtx,
+                            )
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
                             onLoadModelSuccess("LLM model loaded")
                         }.onFailure { error ->
@@ -828,7 +863,13 @@ class MainActivity : FragmentActivity() {
                             DiagnosticsLogger.modelLoadStage("VLM_BUILD_RETURNED_SUCCESS")
                             isLoadVlmModel = true
                             vlmWrapper = it
-                            InferenceBridge.setVlm(it, selectModelData.id, selectModelData.displayName, requestedCompute)
+                            InferenceBridge.setVlm(
+                                it,
+                                selectModelData.id,
+                                selectModelData.displayName,
+                                requestedCompute,
+                                if (isNpuVlm) PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS else vlmContextSize(vlmVisionConfig),
+                            )
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
                             onLoadModelSuccess("VLM model loaded")
                         }.onFailure { error ->
@@ -958,9 +999,30 @@ class MainActivity : FragmentActivity() {
             }
     }
 
+    private fun showAppMenu(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add(0, MENU_MANAGE_MODELS, 0, "Manage models")
+            menu.add(0, MENU_WEB_SERVER, 1, "Web server")
+            menu.add(0, MENU_DIAGNOSTICS, 2, "Diagnostics")
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    MENU_MANAGE_MODELS -> btnModels.performClick()
+                    MENU_WEB_SERVER -> btnServer.performClick()
+                    MENU_DIAGNOSTICS -> btnDiagnostics.performClick()
+                    else -> return@setOnMenuItemClickListener false
+                }
+                true
+            }
+            show()
+        }
+    }
+
     private fun setListeners() {
         btnModels.setOnClickListener {
-            startActivity(Intent(this, ModelManagementActivity::class.java))
+            startActivityForResult(
+                Intent(this, ModelManagementActivity::class.java),
+                REQUEST_MODEL_MANAGEMENT,
+            )
         }
         btnServer.setOnClickListener {
             startActivity(Intent(this, ServerActivity::class.java))
@@ -968,9 +1030,19 @@ class MainActivity : FragmentActivity() {
         btnDiagnostics.setOnClickListener {
             startActivity(Intent(this, DiagnosticsActivity::class.java))
         }
+        btnSettingsMenu.setOnClickListener { showAppMenu(it) }
 
         btnAddImage.setOnClickListener {
             openGallery()
+        }
+        btnAttachText.setOnClickListener { openTextTranscriptPicker() }
+        btnDocumentMode.setOnClickListener {
+            documentLectureMode = !documentLectureMode
+            refreshDocumentUi()
+        }
+        btnClearDocuments.setOnClickListener {
+            selectedDocuments.clear()
+            refreshDocumentUi()
         }
 
         btnClearHistory.setOnClickListener {
@@ -1044,10 +1116,22 @@ class MainActivity : FragmentActivity() {
                     .show()
                 return@setOnClickListener
             }
+            // Transcript attachments use a bounded document pipeline instead
+            // of stuffing the entire file into one model context.
+            if (selectedDocuments.isNotEmpty()) {
+                if (isGenerating) return@setOnClickListener
+                sendDocumentRequest(etInput.text.trim().toString())
+                return@setOnClickListener
+            }
+
             // Guard against re-entry: a second click while a previous
             // generate() is still running would race on the native handle
             // and crash the app.
             if (isGenerating) return@setOnClickListener
+            if (DocumentProcessor.isProcessing()) {
+                Toast.makeText(this, "A transcript task is already using the model.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             if (!InferenceBridge.mutex.tryLock()) {
                 Toast.makeText(this, "The model is busy serving another request.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
@@ -1155,10 +1239,24 @@ class MainActivity : FragmentActivity() {
                                 enableThinking,
                             ).onSuccess { templateOutput ->
                                 Log.d(TAG, "LLM chat template prepared; chars=${templateOutput.formattedText.length}")
+                                val safeMaxTokens = InferenceBridge.safeResponseBudget(
+                                    templateOutput.formattedText,
+                                    PerformanceTuning.DEFAULT_RESPONSE_TOKENS,
+                                )
+                                if (safeMaxTokens < PerformanceTuning.MIN_RESPONSE_TOKENS) {
+                                    runOnUiThread {
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "Conversation is too long for this model context. Clear older messages and try again.",
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
+                                    return@onSuccess
+                                }
                                 llmWrapper
                                     .generateStreamFlow(
                                         templateOutput.formattedText,
-                                        GenerationConfigSample().toGenerationConfig(),
+                                        GenerationConfigSample(maxTokens = safeMaxTokens).toGenerationConfig(),
                                     ).collect { streamResult ->
                                         handleResult(sb, streamResult)
                                     }
@@ -1194,7 +1292,11 @@ class MainActivity : FragmentActivity() {
                 return@setOnClickListener
             }
             // The native model handle is shared with the HTTP server. Never
-            // destroy it while either UI or API inference owns the mutex.
+            // destroy it while either UI, document processing, or API inference is using it.
+            if (DocumentProcessor.isProcessing()) {
+                Toast.makeText(this@MainActivity, "Transcript processing is still running.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             if (!InferenceBridge.mutex.tryLock()) {
                 Toast.makeText(this@MainActivity, "Model is busy. Try again when inference finishes.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
@@ -1252,6 +1354,8 @@ class MainActivity : FragmentActivity() {
             }
         }
         btnStop.setOnClickListener {
+            documentStopRequested = true
+            documentJob?.cancel()
             if (!hasLoadedModel()) {
                 Toast
                     .makeText(
@@ -1452,10 +1556,18 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun trimLlmHistoryForMemory() {
+        val contextCharBudget =
+            ((InferenceBridge.contextWindowTokens -
+                PerformanceTuning.CONTEXT_SAFETY_TOKENS -
+                PerformanceTuning.DEFAULT_RESPONSE_TOKENS)
+                .coerceAtLeast(PerformanceTuning.MIN_RESPONSE_TOKENS) * 2)
         while (chatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
-            chatList.sumOf { it.content.length } > PerformanceTuning.MAX_NATIVE_HISTORY_CHARS
+            chatList.sumOf { it.content.length } > minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
         ) {
-            if (chatList.isEmpty()) break
+            // Preserve the latest user turn even when it alone is very long. The
+            // context-budget check after chat templating will then show a clear
+            // message instead of silently deleting the user's prompt.
+            if (chatList.size <= 1) break
             chatList.removeAt(0)
         }
     }
@@ -1464,10 +1576,15 @@ class MainActivity : FragmentActivity() {
         fun chars(): Int = vlmChatList.sumOf { message ->
             message.contents.sumOf { content -> if (content.type == "text") content.text?.length ?: 0 else 0 }
         }
+        val contextCharBudget =
+            ((InferenceBridge.contextWindowTokens -
+                PerformanceTuning.CONTEXT_SAFETY_TOKENS -
+                PerformanceTuning.DEFAULT_RESPONSE_TOKENS)
+                .coerceAtLeast(PerformanceTuning.MIN_RESPONSE_TOKENS) * 2)
         while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
-            chars() > PerformanceTuning.MAX_NATIVE_HISTORY_CHARS
+            chars() > minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
         ) {
-            if (vlmChatList.isEmpty()) break
+            if (vlmChatList.size <= 1) break
             vlmChatList.removeAt(0)
         }
     }
@@ -1507,6 +1624,26 @@ class MainActivity : FragmentActivity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != Activity.RESULT_OK) return
+
+        if (requestCode == REQUEST_MODEL_MANAGEMENT) {
+            val modelId = data?.getStringExtra(ModelManagementActivity.EXTRA_SELECTED_MODEL_ID)
+            val action = data?.getStringExtra(ModelManagementActivity.EXTRA_MODEL_ACTION)
+            if (!modelId.isNullOrBlank()) {
+                AppPreferences.setSelectedModelId(this, modelId)
+                syncSelectedModelFromPreferences()
+                refreshSelectedModelUi()
+                when (action) {
+                    ModelManagementActivity.ACTION_LOAD -> btnLoadModel.performClick()
+                    ModelManagementActivity.ACTION_UNLOAD -> btnUnloadModel.performClick()
+                }
+            }
+            return
+        }
+
+        if (requestCode == REQUEST_TEXT_TRANSCRIPTS) {
+            importSelectedTextTranscripts(data)
+            return
+        }
 
         modelScope.launch {
             var sourceFile: File? = null
@@ -1553,6 +1690,161 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun openTextTranscriptPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        startActivityForResult(intent, REQUEST_TEXT_TRANSCRIPTS)
+    }
+
+    private fun importSelectedTextTranscripts(data: Intent?) {
+        val uris = mutableListOf<Uri>()
+        data?.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount) uris += clip.getItemAt(i).uri
+        }
+        data?.data?.let { if (it !in uris) uris += it }
+        if (uris.isEmpty()) return
+
+        modelScope.launch {
+            var imported = 0
+            var lastError: String? = null
+            uris.forEach { uri ->
+                DocumentProcessor.importUri(this@MainActivity, uri)
+                    .onSuccess { ref ->
+                        if (selectedDocuments.none { it.id == ref.id }) selectedDocuments += ref
+                        imported += 1
+                    }
+                    .onFailure { error -> lastError = error.message }
+            }
+            runOnUiThread {
+                refreshDocumentUi()
+                val message = when {
+                    imported > 0 && lastError != null -> "Attached $imported transcript(s). One or more files could not be added: $lastError"
+                    imported > 0 -> "Attached $imported transcript${if (imported == 1) "" else "s"}."
+                    else -> lastError ?: "No transcript files were added."
+                }
+                Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun refreshDocumentUi(progress: String? = null) {
+        if (!::llDocuments.isInitialized) return
+        runOnUiThread {
+            val count = selectedDocuments.size
+            llDocuments.visibility = if (count > 0) View.VISIBLE else View.GONE
+            tvAttachedDocuments.text = if (count == 0) "" else buildString {
+                append("$count transcript${if (count == 1) "" else "s"} attached")
+                selectedDocuments.take(3).forEach { append("\n• ${it.displayName}") }
+                if (count > 3) append("\n• +${count - 3} more")
+            }
+            btnDocumentMode.text = if (documentLectureMode) "Lecture notes" else "Ask files"
+            tvDocumentStatus.text = progress ?: if (documentLectureMode) {
+                "Whole-lecture mode • all attached files are processed in order. Leave the message blank to use the lecture-notes preset."
+            } else {
+                "Ask-files mode • type a question and only relevant transcript excerpts are sent to the model."
+            }
+            refreshSendButtonState()
+        }
+    }
+
+    private fun sendDocumentRequest(input: String) {
+        if (selectedDocuments.isEmpty()) return
+        if (!documentLectureMode && input.isBlank()) {
+            Toast.makeText(this, "Type a question about the attached transcripts.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val docsSnapshot = selectedDocuments.toList()
+        val userText = if (documentLectureMode) {
+            input.ifBlank { DocumentProcessor.DEFAULT_LECTURE_PROMPT }
+        } else {
+            input
+        }
+        etInput.setText("")
+        etInput.clearFocus()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(etInput.windowToken, 0)
+
+        messages.add(
+            Message(
+                if (documentLectureMode) {
+                    "Summarize ${docsSnapshot.size} attached lecture transcript${if (docsSnapshot.size == 1) "" else "s"}."
+                } else {
+                    userText
+                },
+                MessageType.USER,
+            ),
+        )
+        reloadRecycleView()
+        showLoadingIndicator()
+        isGenerating = true
+        refreshSendButtonState()
+        DiagnosticsLogger.checkpoint(
+            if (documentLectureMode) "DOCUMENT_SUMMARY_BEGIN" else "DOCUMENT_QA_BEGIN",
+            "files=${docsSnapshot.size}",
+        )
+
+        documentStopRequested = false
+        documentJob = modelScope.launch {
+            try {
+                val result = if (documentLectureMode) {
+                    DocumentProcessor.summarizeLecture(
+                        context = this@MainActivity,
+                        documents = docsSnapshot,
+                        customPrompt = userText,
+                    onProgress = { p ->
+                        refreshDocumentUi(
+                            buildString {
+                                append(p.phase)
+                                if (p.total > 0) append(" • ${p.completed}/${p.total}")
+                                if (p.detail.isNotBlank()) append(" • ${p.detail}")
+                            },
+                        )
+                    },
+                    shouldCancel = { documentStopRequested },
+                    ).map { it.markdown }
+                } else {
+                    DocumentProcessor.answerFromDocuments(this@MainActivity, docsSnapshot, userText)
+                }
+                result.onSuccess { answer ->
+                    runOnUiThread {
+                        removeLoadingIndicatorOnMainThread()
+                        messages.add(Message(answer, MessageType.ASSISTANT))
+                        trimUiTranscriptForMemory()
+                        reloadRecycleView()
+                        if (documentLectureMode) {
+                            documentLectureMode = false
+                            refreshDocumentUi("Summary complete • switched to Ask files for follow-up questions.")
+                        } else {
+                            refreshDocumentUi()
+                        }
+                    }
+                }.onFailure { error ->
+                    DiagnosticsLogger.log("ERROR", "Documents", "document request failed", error)
+                    val wasStopped = error is java.util.concurrent.CancellationException || documentStopRequested
+                    runOnUiThread {
+                        removeLoadingIndicatorOnMainThread()
+                        val text = if (wasStopped) {
+                            "Document processing stopped."
+                        } else {
+                            "Document processing failed: ${error.message}"
+                        }
+                        messages.add(Message(text, MessageType.ASSISTANT))
+                        reloadRecycleView()
+                        refreshDocumentUi(if (wasStopped) "Stopped" else "Failed: ${error.message}")
+                    }
+                }
+            } finally {
+                isGenerating = false
+                documentJob = null
+                documentStopRequested = false
+                refreshSendButtonState()
+            }
+        }
+    }
+
     private fun clearHistory() {
         if (!hasLoadedModel()) {
             chatList.clear()
@@ -1560,6 +1852,10 @@ class MainActivity : FragmentActivity() {
             messages.clear()
             clearImages()
             reloadRecycleView()
+            return
+        }
+        if (DocumentProcessor.isProcessing()) {
+            Toast.makeText(this, "Transcript processing is still running.", Toast.LENGTH_SHORT).show()
             return
         }
         if (!InferenceBridge.mutex.tryLock()) {
@@ -1761,6 +2057,11 @@ class MainActivity : FragmentActivity() {
     }
 
     companion object {
+        private const val REQUEST_TEXT_TRANSCRIPTS = 3001
+        private const val REQUEST_MODEL_MANAGEMENT = 3002
+        private const val MENU_MANAGE_MODELS = 4101
+        private const val MENU_WEB_SERVER = 4102
+        private const val MENU_DIAGNOSTICS = 4103
         private const val TAG = "GenieXDemo"
 
         /**

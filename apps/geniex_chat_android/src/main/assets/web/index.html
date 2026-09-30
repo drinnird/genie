@@ -68,7 +68,7 @@
       border-radius: 10px; padding: 8px 12px; cursor: pointer;
     }
     main { width: 100%; }
-    .messages { max-width: 960px; margin: 0 auto; padding: 18px 16px 140px; display: flex; flex-direction: column; gap: 14px; }
+    .messages { max-width: 960px; margin: 0 auto; padding: 18px 16px 220px; display: flex; flex-direction: column; gap: 14px; }
     .empty { margin: 12vh auto 0; max-width: 520px; text-align: center; color: var(--muted); padding: 24px; }
     .empty strong { display: block; color: var(--text); font-size: 20px; margin-bottom: 8px; }
     .message { display: flex; gap: 10px; align-items: flex-start; }
@@ -97,6 +97,12 @@
       width: 100%; resize: none; min-height: 48px; max-height: 180px; border: 0; outline: 0;
       padding: 8px 10px; background: transparent; color: var(--text); line-height: 1.4;
     }
+    .docbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 2px 4px 6px; }
+    .docbar[hidden] { display: none; }
+    .docbar select { min-height: 40px; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; background: var(--bg); color: var(--text); }
+    .file-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 100%; max-height: 70px; overflow: auto; }
+    .file-chip { max-width: 280px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-input { display: none; }
     .composer-actions { display: flex; align-items: center; gap: 8px; }
     .hint { flex: 1; color: var(--muted); font-size: 11px; padding-left: 8px; }
     .send, .stop {
@@ -145,6 +151,16 @@
 
   <div class="composer-wrap">
     <div class="composer">
+      <input class="file-input" id="txtFiles" type="file" accept=".txt,text/plain" multiple>
+      <div class="docbar">
+        <button class="ghost" id="attachTxt" type="button">Attach TXT</button>
+        <select id="docMode" aria-label="Transcript mode">
+          <option value="lecture">Lecture notes</option>
+          <option value="ask">Ask files</option>
+        </select>
+        <button class="ghost" id="clearFiles" type="button" hidden>Remove files</button>
+        <div class="file-list" id="fileList"></div>
+      </div>
       <label class="sr-only" for="prompt">Message</label>
       <textarea id="prompt" rows="1" placeholder="Message the loaded model…" aria-label="Message"></textarea>
       <div class="composer-actions">
@@ -168,14 +184,22 @@
     clear: document.getElementById('clearChat'),
     copyApi: document.getElementById('copyApi'),
     model: document.getElementById('modelText'),
-    status: document.getElementById('statusBadge')
+    status: document.getElementById('statusBadge'),
+    files: document.getElementById('txtFiles'),
+    attachTxt: document.getElementById('attachTxt'),
+    clearFiles: document.getElementById('clearFiles'),
+    fileList: document.getElementById('fileList'),
+    docMode: document.getElementById('docMode')
   };
 
   let messages = [];
   let busy = false;
   let modelLoaded = false;
+  let apiKeyRequired = false;
   let activeController = null;
   let apiKey = sessionStorage.getItem('geniex_api_key') || '';
+  let attachedFiles = [];
+  try { attachedFiles = JSON.parse(sessionStorage.getItem('geniex_attached_files') || '[]'); } catch (_) {}
   els.key.value = apiKey;
 
   function authHeaders(json = false) {
@@ -192,8 +216,30 @@
   }
 
   function updateSendState() {
-    els.send.disabled = busy || !modelLoaded || !els.prompt.value.trim();
+    const hasDocs = attachedFiles.length > 0;
+    const docsReady = hasDocs && (els.docMode.value === 'lecture' || els.prompt.value.trim());
+    els.send.disabled = busy || !modelLoaded || (apiKeyRequired && !apiKey) || (!els.prompt.value.trim() && !docsReady);
     els.stop.disabled = !busy;
+  }
+
+  function renderFiles() {
+    els.fileList.replaceChildren();
+    for (const file of attachedFiles) {
+      const chip = document.createElement('div');
+      chip.className = 'file-chip';
+      chip.textContent = `${file.name} • ${Math.max(1, Math.round(file.size / 1024))} KB`;
+      els.fileList.appendChild(chip);
+    }
+    els.clearFiles.hidden = attachedFiles.length === 0;
+    sessionStorage.setItem('geniex_attached_files', JSON.stringify(attachedFiles));
+    if (attachedFiles.length && els.docMode.value === 'lecture') {
+      els.prompt.placeholder = 'Optional: customize the lecture-summary instructions…';
+    } else if (attachedFiles.length) {
+      els.prompt.placeholder = 'Ask a question about the attached transcripts…';
+    } else {
+      els.prompt.placeholder = 'Message the loaded model…';
+    }
+    updateSendState();
   }
 
   function growTextarea() {
@@ -241,7 +287,18 @@
         return;
       }
       const healthData = await health.json();
+      apiKeyRequired = healthData.auth_required === true;
       if (healthData.busy) setStatus('Busy', false, false);
+      if (apiKeyRequired && !apiKey) {
+        els.model.textContent = 'Model loaded • API key required';
+        els.key.placeholder = 'Please enter the API key from the Android Server screen';
+        els.key.setAttribute('aria-invalid', 'true');
+        setStatus('Enter API key', false, true);
+        updateSendState();
+        return;
+      }
+      els.key.placeholder = 'API key (required for LAN access)';
+      els.key.removeAttribute('aria-invalid');
       const models = await fetch('/v1/models', { headers: authHeaders(), cache: 'no-store' });
       if (models.status === 401) {
         els.model.textContent = 'Model loaded • API key required';
@@ -252,7 +309,10 @@
       if (!models.ok) throw new Error(`HTTP ${models.status}`);
       const data = await models.json();
       const model = data.data?.[0];
-      els.model.textContent = model ? `${model.name || model.id} • ${(model.compute || 'unknown').toUpperCase()}` : 'Model loaded';
+      const contextWindow = model?.context_window || healthData.context_window;
+      els.model.textContent = model
+        ? `${model.name || model.id} • ${(model.compute || 'unknown').toUpperCase()}${contextWindow ? ` • ${contextWindow} ctx` : ''}`
+        : 'Model loaded';
       setStatus('Ready', true, false);
     } catch (err) {
       modelLoaded = false;
@@ -262,9 +322,146 @@
     updateSendState();
   }
 
+  async function uploadSelectedFiles(fileList) {
+    if (!fileList?.length) return;
+    if (apiKeyRequired && !apiKey) {
+      addBubble('assistant', 'Please enter the API key before uploading transcripts.', true);
+      els.key.focus();
+      return;
+    }
+    busy = true;
+    updateSendState();
+    setStatus('Uploading transcripts');
+    try {
+      for (const file of Array.from(fileList)) {
+        if (!file.name.toLowerCase().endsWith('.txt')) throw new Error(`${file.name}: only .txt files are supported`);
+        const response = await fetch('/v1/files', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'text/plain; charset=utf-8', 'X-Filename': encodeURIComponent(file.name) },
+          body: file
+        });
+        if (!response.ok) {
+          let detail = `Upload failed: HTTP ${response.status}`;
+          try { detail = (await response.json()).error?.message || detail; } catch (_) {}
+          throw new Error(detail);
+        }
+        const stored = await response.json();
+        attachedFiles.push(stored);
+        renderFiles();
+      }
+      setStatus('Ready', true, false);
+    } catch (err) {
+      addBubble('assistant', err instanceof Error ? err.message : String(err), true);
+      setStatus('Upload failed', false, true);
+    } finally {
+      busy = false;
+      els.files.value = '';
+      updateSendState();
+    }
+  }
+
+  async function sendDocumentMessage(text) {
+    if (!attachedFiles.length) return;
+    if (els.docMode.value === 'ask' && !text.trim()) {
+      addBubble('assistant', 'Type a question about the attached transcripts.', true);
+      return;
+    }
+    busy = true;
+    updateSendState();
+    activeController = new AbortController();
+    const ids = attachedFiles.map(f => f.id);
+    if (els.docMode.value === 'lecture') {
+      addBubble('user', `Summarize ${attachedFiles.length} attached lecture transcript${attachedFiles.length === 1 ? '' : 's'}.`);
+      const assistantBubble = addBubble('assistant', 'Preparing lecture notes…');
+      assistantBubble.classList.add('typing');
+      try {
+        const response = await fetch('/v1/documents/summarize', {
+          method: 'POST', headers: authHeaders(true), signal: activeController.signal,
+          body: JSON.stringify({ file_ids: ids, ...(text.trim() ? { prompt: text.trim() } : {}) })
+        });
+        if (!response.ok || !response.body) {
+          let detail = `HTTP ${response.status}`;
+          try { detail = (await response.json()).error?.message || detail; } catch (_) {}
+          throw new Error(detail);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finalContent = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let split;
+          while ((split = buffer.indexOf('\n\n')) >= 0) {
+            const event = buffer.slice(0, split); buffer = buffer.slice(split + 2);
+            for (const line of event.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              if (!payload || payload === '[DONE]') continue;
+              const data = JSON.parse(payload);
+              if (data.error) throw new Error(data.error.message || 'Document summary failed');
+              if (data.type === 'progress') {
+                assistantBubble.textContent = `${data.phase}${data.total ? ` • ${data.completed}/${data.total}` : ''}${data.detail ? ` • ${data.detail}` : ''}`;
+              } else if (data.type === 'result') {
+                finalContent = data.content || '';
+                assistantBubble.textContent = finalContent;
+              }
+            }
+          }
+        }
+        assistantBubble.classList.remove('typing');
+        els.docMode.value = 'ask';
+        renderFiles();
+      } catch (err) {
+        assistantBubble.classList.remove('typing');
+        assistantBubble.classList.add('error');
+        assistantBubble.textContent = err?.name === 'AbortError' ? 'Document processing stopped.' : (err instanceof Error ? err.message : String(err));
+      }
+    } else {
+      addBubble('user', text);
+      const assistantBubble = addBubble('assistant', 'Searching transcripts…');
+      assistantBubble.classList.add('typing');
+      try {
+        const response = await fetch('/v1/documents/query', {
+          method: 'POST', headers: authHeaders(true), signal: activeController.signal,
+          body: JSON.stringify({ file_ids: ids, question: text })
+        });
+        if (!response.ok) {
+          let detail = `HTTP ${response.status}`;
+          try { detail = (await response.json()).error?.message || detail; } catch (_) {}
+          throw new Error(detail);
+        }
+        const data = await response.json();
+        assistantBubble.classList.remove('typing');
+        assistantBubble.textContent = data.answer || 'No answer returned.';
+      } catch (err) {
+        assistantBubble.classList.remove('typing');
+        assistantBubble.classList.add('error');
+        assistantBubble.textContent = err?.name === 'AbortError' ? 'Request stopped.' : (err instanceof Error ? err.message : String(err));
+      }
+    }
+    activeController = null;
+    busy = false;
+    els.prompt.value = '';
+    growTextarea();
+    updateSendState();
+  }
+
   async function sendMessage() {
     const text = els.prompt.value.trim();
-    if (!text || busy || !modelLoaded) return;
+    const blankLectureRequest = attachedFiles.length > 0 && els.docMode.value === 'lecture';
+    if ((!text && !blankLectureRequest) || busy || !modelLoaded) return;
+    if (apiKeyRequired && !apiKey) {
+      addBubble('assistant', 'Please enter the API key shown on the Android Server screen, then tap Use key.', true);
+      setStatus('Enter API key', false, true);
+      els.key.focus();
+      return;
+    }
+    if (attachedFiles.length) {
+      await sendDocumentMessage(text);
+      return;
+    }
 
     busy = true;
     els.prompt.value = '';
@@ -286,11 +483,14 @@
           model: 'loaded-model',
           messages,
           stream: true,
-          max_tokens: 1024
+          max_tokens: 512
         })
       });
 
-      if (response.status === 401) throw new Error('API key rejected. Enter the key shown in the Android Server screen.');
+      if (response.status === 401) {
+        apiKeyRequired = true;
+        throw new Error(apiKey ? 'API key rejected. Check the key shown in the Android Server screen.' : 'Please enter the API key shown on the Android Server screen.');
+      }
       if (!response.ok || !response.body) {
         let detail = `HTTP ${response.status}`;
         try { detail = (await response.json()).error?.message || detail; } catch (_) {}
@@ -352,11 +552,20 @@
     } catch (_) {}
   }
 
+  els.attachTxt.addEventListener('click', () => els.files.click());
+  els.files.addEventListener('change', () => uploadSelectedFiles(els.files.files));
+  els.clearFiles.addEventListener('click', () => { attachedFiles = []; renderFiles(); });
+  els.docMode.addEventListener('change', renderFiles);
   els.stop.addEventListener('click', stopGeneration);
   els.saveKey.addEventListener('click', () => {
     apiKey = els.key.value.trim();
-    if (apiKey) sessionStorage.setItem('geniex_api_key', apiKey);
-    else sessionStorage.removeItem('geniex_api_key');
+    if (apiKey) {
+      sessionStorage.setItem('geniex_api_key', apiKey);
+      els.key.removeAttribute('aria-invalid');
+    } else {
+      sessionStorage.removeItem('geniex_api_key');
+    }
+    if (!apiKey && apiKeyRequired) setStatus('Enter API key', false, true);
     refreshStatus();
   });
 
@@ -382,6 +591,7 @@
     }
   });
 
+  renderFiles();
   refreshStatus();
   setInterval(refreshStatus, 30000);
   growTextarea();

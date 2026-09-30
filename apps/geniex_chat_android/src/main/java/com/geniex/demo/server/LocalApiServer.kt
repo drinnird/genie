@@ -3,6 +3,7 @@ package com.geniex.demo.server
 import android.content.Context
 import android.os.SystemClock
 import com.geniex.demo.diagnostics.DiagnosticsLogger
+import com.geniex.demo.documents.DocumentProcessor
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -34,11 +35,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 object LocalApiServer {
     private const val MAX_BODY_BYTES = 512 * 1024
-    private const val DEFAULT_MAX_TOKENS = 2048
+    private const val MAX_TEXT_UPLOAD_BYTES = 64 * 1024 * 1024
+    private const val DEFAULT_MAX_TOKENS = 512
     private const val API_WORKER_THREADS = 4
     private val running = AtomicBoolean(false)
     @Volatile private var executor: ExecutorService? = null
     private val apiInferenceBusy = AtomicBoolean(false)
+    private val documentStopRequested = AtomicBoolean(false)
     private val json = Json { ignoreUnknownKeys = true }
 
     @Volatile private var serverSocket: ServerSocket? = null
@@ -163,11 +166,33 @@ object LocalApiServer {
                 }
 
                 if (!authorized(headers)) {
-                    return writeJson(output, 401, errorJson(401, "Invalid API Key", "authentication_error"))
+                    val hasAuthorization = !headers["authorization"].isNullOrBlank()
+                    val message = if (apiKey.isNotBlank() && !hasAuthorization) {
+                        "API key required. Enter the key shown in the Android Server screen."
+                    } else {
+                        "Invalid API key. Check the key shown in the Android Server screen."
+                    }
+                    return writeJson(output, 401, errorJson(401, message, "authentication_error"))
                 }
 
                 val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-                if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
+                if (contentLength < 0) {
+                    return writeJson(output, 400, errorJson(400, "invalid content length", "invalid_request_error"))
+                }
+
+                // Transcript uploads are streamed directly to disk so a large TXT
+                // file never becomes a giant request ByteArray in the Android heap.
+                if (method == "POST" && path == "/v1/files") {
+                    if (contentLength > MAX_TEXT_UPLOAD_BYTES) {
+                        return writeJson(output, 413, errorJson(413, "TXT file exceeds the 64 MB upload limit", "invalid_request_error"))
+                    }
+                    return handleTextUpload(output, input, headers, contentLength)
+                }
+                if (method == "GET" && path == "/v1/files") {
+                    return handleListFiles(output)
+                }
+
+                if (contentLength > MAX_BODY_BYTES) {
                     return writeJson(output, 413, errorJson(413, "request body too large", "invalid_request_error"))
                 }
                 val body = if (contentLength > 0) readExact(input, contentLength) else ByteArray(0)
@@ -178,6 +203,8 @@ object LocalApiServer {
                     method == "POST" && path == "/v1/chat/completions" -> handleChat(output, body)
                     method == "POST" && path == "/v1/completions" -> handleOpenAiCompletion(output, body)
                     method == "POST" && path == "/completion" -> handleLlamaCompletion(output, body)
+                    method == "POST" && path == "/v1/documents/summarize" -> handleDocumentSummary(output, body)
+                    method == "POST" && path == "/v1/documents/query" -> handleDocumentQuery(output, body)
                     method == "POST" && (path == "/v1/stop" || path == "/stop") -> handleStop(output)
                     else -> writeJson(output, 404, errorJson(404, "not found", "not_found_error"))
                 }
@@ -201,6 +228,8 @@ object LocalApiServer {
                     put("model", JsonPrimitive(InferenceBridge.activeModelId ?: "loaded-model"))
                     put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
                     put("busy", JsonPrimitive(apiInferenceBusy.get() || InferenceBridge.isBusy()))
+                    put("auth_required", JsonPrimitive(apiKey.isNotBlank()))
+                    put("context_window", JsonPrimitive(InferenceBridge.contextWindowTokens))
                 },
             )
         } else {
@@ -243,7 +272,7 @@ object LocalApiServer {
                     onSuccess = { response -> writeJson(output, 200, chatCompletionJson(response)) },
                     onFailure = {
                         DiagnosticsLogger.log("ERROR", "ApiServer", "inference failed", it)
-                        writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error"))
+                        writeInferenceError(output, it)
                     },
                 )
             }
@@ -285,7 +314,8 @@ object LocalApiServer {
                     DiagnosticsLogger.log("ERROR", "ApiServer", "streaming inference failed", it)
                 }
                 runCatching {
-                    writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                    val (code, message, type) = inferenceErrorStatus(it)
+                    writeSseData(output, errorJson(code, message, type))
                     writeSseDone(output)
                 }
             },
@@ -301,7 +331,7 @@ object LocalApiServer {
             400,
             errorJson(400, "invalid JSON", "invalid_request_error"),
         )
-        val prompt = root["prompt"]?.jsonPrimitive?.contentOrNull
+        val prompt = root["prompt"]?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() }
             ?: return writeJson(output, 400, errorJson(400, "prompt must be a string", "invalid_request_error"))
         val stream = root["stream"]?.jsonPrimitive?.booleanOrNull == true
         val maxTokens = requestedMaxTokens(root)
@@ -327,7 +357,8 @@ object LocalApiServer {
                 },
                 onFailure = {
                     runCatching {
-                        writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                        val (code, message, type) = inferenceErrorStatus(it)
+                        writeSseData(output, errorJson(code, message, type))
                         writeSseDone(output)
                     }
                 },
@@ -359,7 +390,7 @@ object LocalApiServer {
                         },
                     )
                 },
-                onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
+                onFailure = { writeInferenceError(output, it) },
             )
         }
         } finally {
@@ -376,7 +407,7 @@ object LocalApiServer {
             400,
             errorJson(400, "invalid JSON", "invalid_request_error"),
         )
-        val prompt = root["prompt"]?.jsonPrimitive?.contentOrNull
+        val prompt = root["prompt"]?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() }
             ?: return writeJson(output, 400, errorJson(400, "prompt must be a string", "invalid_request_error"))
         val maxTokens = root["n_predict"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 } ?: requestedMaxTokens(root)
         if (!acquireInferenceSlot(output, "/completion")) return
@@ -394,7 +425,7 @@ object LocalApiServer {
                     },
                 )
             },
-            onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
+            onFailure = { writeInferenceError(output, it) },
         )
         } finally {
             releaseInferenceSlot("/completion")
@@ -403,6 +434,7 @@ object LocalApiServer {
 
     private fun handleStop(output: BufferedOutputStream) {
         val wasBusy = apiInferenceBusy.get() || InferenceBridge.isBusy()
+        documentStopRequested.set(true)
         if (wasBusy) requestInferenceStop()
         writeJson(
             output,
@@ -414,7 +446,159 @@ object LocalApiServer {
         )
     }
 
+    private fun handleTextUpload(
+        output: BufferedOutputStream,
+        input: BufferedInputStream,
+        headers: Map<String, String>,
+        contentLength: Int,
+    ) {
+        val context = appContext ?: return writeJson(output, 500, errorJson(500, "server context unavailable", "server_error"))
+        val rawName = headers["x-filename"] ?: "transcript.txt"
+        val name = runCatching { java.net.URLDecoder.decode(rawName, "UTF-8") }.getOrDefault(rawName)
+        val limited = object : java.io.InputStream() {
+            var remaining = contentLength
+            override fun read(): Int {
+                if (remaining <= 0) return -1
+                val value = input.read()
+                if (value >= 0) remaining -= 1
+                return value
+            }
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                if (remaining <= 0) return -1
+                val count = input.read(buffer, offset, minOf(length, remaining))
+                if (count > 0) remaining -= count
+                return count
+            }
+        }
+        DocumentProcessor.storeUpload(context, name, limited, contentLength.toLong()).fold(
+            onSuccess = { ref ->
+                writeJson(
+                    output,
+                    200,
+                    buildJsonObject {
+                        put("id", JsonPrimitive(ref.id))
+                        put("name", JsonPrimitive(ref.displayName))
+                        put("size", JsonPrimitive(ref.sizeBytes))
+                    },
+                )
+            },
+            onFailure = { error -> writeJson(output, 400, errorJson(400, error.message ?: "upload failed", "invalid_request_error")) },
+        )
+    }
+
+    private fun handleListFiles(output: BufferedOutputStream) {
+        val context = appContext ?: return writeJson(output, 500, errorJson(500, "server context unavailable", "server_error"))
+        val docs = DocumentProcessor.listDocuments(context)
+        writeJson(
+            output,
+            200,
+            buildJsonObject {
+                put(
+                    "data",
+                    buildJsonArray {
+                        docs.forEach { ref ->
+                            add(
+                                buildJsonObject {
+                                    put("id", JsonPrimitive(ref.id))
+                                    put("name", JsonPrimitive(ref.displayName))
+                                    put("size", JsonPrimitive(ref.sizeBytes))
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    private fun parseDocumentRefs(root: JsonObject): List<DocumentProcessor.DocumentRef>? {
+        val context = appContext ?: return null
+        val ids = runCatching { root["file_ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } }.getOrNull()
+            ?: return null
+        return ids.mapNotNull { DocumentProcessor.findDocument(context, it) }.takeIf { it.size == ids.size }
+    }
+
+    private fun handleDocumentSummary(output: BufferedOutputStream, body: ByteArray) {
+        if (!InferenceBridge.isLoaded()) return writeJson(output, 503, errorJson(503, "no model loaded", "unavailable_error"))
+        val context = appContext ?: return writeJson(output, 500, errorJson(500, "server context unavailable", "server_error"))
+        val root = parseJsonObject(body) ?: return writeJson(output, 400, errorJson(400, "invalid JSON", "invalid_request_error"))
+        val docs = parseDocumentRefs(root) ?: return writeJson(output, 400, errorJson(400, "file_ids must identify uploaded TXT files", "invalid_request_error"))
+        if (docs.isEmpty()) return writeJson(output, 400, errorJson(400, "attach at least one TXT file", "invalid_request_error"))
+        val prompt = root["prompt"]?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() }
+        if (!acquireInferenceSlot(output, "/v1/documents/summarize")) return
+        documentStopRequested.set(false)
+        try {
+            writeSseHeaders(output)
+            val result = runBlocking {
+                DocumentProcessor.summarizeLecture(
+                    context = context,
+                    documents = docs,
+                    customPrompt = prompt,
+                    onProgress = { progress ->
+                    writeSseData(
+                        output,
+                        buildJsonObject {
+                            put("type", JsonPrimitive("progress"))
+                            put("phase", JsonPrimitive(progress.phase))
+                            put("completed", JsonPrimitive(progress.completed))
+                            put("total", JsonPrimitive(progress.total))
+                            put("detail", JsonPrimitive(progress.detail))
+                        },
+                    )
+                    },
+                    shouldCancel = { documentStopRequested.get() },
+                )
+            }
+            result.fold(
+                onSuccess = { summary ->
+                    writeSseData(
+                        output,
+                        buildJsonObject {
+                            put("type", JsonPrimitive("result"))
+                            put("content", JsonPrimitive(summary.markdown))
+                            put("saved_as", JsonPrimitive(summary.savedFile.name))
+                        },
+                    )
+                    writeSseDone(output)
+                },
+                onFailure = { error ->
+                    writeSseData(output, errorJson(500, error.message ?: "document summary failed", "document_error"))
+                    writeSseDone(output)
+                },
+            )
+        } finally {
+            documentStopRequested.set(false)
+            releaseInferenceSlot("/v1/documents/summarize")
+        }
+    }
+
+    private fun handleDocumentQuery(output: BufferedOutputStream, body: ByteArray) {
+        if (!InferenceBridge.isLoaded()) return writeJson(output, 503, errorJson(503, "no model loaded", "unavailable_error"))
+        val context = appContext ?: return writeJson(output, 500, errorJson(500, "server context unavailable", "server_error"))
+        val root = parseJsonObject(body) ?: return writeJson(output, 400, errorJson(400, "invalid JSON", "invalid_request_error"))
+        val docs = parseDocumentRefs(root) ?: return writeJson(output, 400, errorJson(400, "file_ids must identify uploaded TXT files", "invalid_request_error"))
+        val question = root["question"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        if (question.isBlank()) return writeJson(output, 400, errorJson(400, "question is required", "invalid_request_error"))
+        if (!acquireInferenceSlot(output, "/v1/documents/query")) return
+        try {
+            val result = runBlocking { DocumentProcessor.answerFromDocuments(context, docs, question) }
+            result.fold(
+                onSuccess = { answer ->
+                    writeJson(output, 200, buildJsonObject { put("answer", JsonPrimitive(answer)) })
+                },
+                onFailure = { writeInferenceError(output, it) },
+            )
+        } finally {
+            releaseInferenceSlot("/v1/documents/query")
+        }
+    }
+
     private fun acquireInferenceSlot(output: BufferedOutputStream, endpoint: String): Boolean {
+        if (DocumentProcessor.isProcessing()) {
+            DiagnosticsLogger.log("INFO", "ApiServer", "document task busy; request rejected endpoint=$endpoint")
+            writeJson(output, 429, errorJson(429, "A transcript task is already using the model", "busy_error"))
+            return false
+        }
         if (!apiInferenceBusy.compareAndSet(false, true)) {
             DiagnosticsLogger.log("INFO", "ApiServer", "busy request rejected endpoint=$endpoint")
             writeJson(output, 429, errorJson(429, "Model is busy with another generation", "busy_error"))
@@ -585,6 +769,7 @@ object LocalApiServer {
                             put("name", JsonPrimitive(InferenceBridge.activeModelName ?: id))
                             put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
                             put("busy", JsonPrimitive(apiInferenceBusy.get() || InferenceBridge.isBusy()))
+                            put("context_window", JsonPrimitive(InferenceBridge.contextWindowTokens))
                         },
                     )
                 } ?: emptyList(),
@@ -595,6 +780,18 @@ object LocalApiServer {
     private fun authorized(headers: Map<String, String>): Boolean {
         if (apiKey.isBlank()) return !lanEnabled
         return headers["authorization"] == "Bearer $apiKey"
+    }
+
+    private fun inferenceErrorStatus(error: Throwable): Triple<Int, String, String> =
+        if (error is InferenceBridge.ContextLengthException) {
+            Triple(400, error.message ?: "context length exceeded", "context_length_exceeded")
+        } else {
+            Triple(500, error.message ?: "inference failed", "server_error")
+        }
+
+    private fun writeInferenceError(output: BufferedOutputStream, error: Throwable) {
+        val (code, message, type) = inferenceErrorStatus(error)
+        writeJson(output, code, errorJson(code, message, type))
     }
 
     private fun errorJson(code: Int, message: String, type: String): JsonObject = buildJsonObject {
