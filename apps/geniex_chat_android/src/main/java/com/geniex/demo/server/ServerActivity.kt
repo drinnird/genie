@@ -4,9 +4,13 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.geniex.demo.databinding.ActivityServerBinding
 import com.geniex.demo.model.AppPreferences
@@ -14,6 +18,17 @@ import java.security.SecureRandom
 
 class ServerActivity : FragmentActivity() {
     private lateinit var binding: ActivityServerBinding
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    "Server will still run, but Android may hide its foreground-service notification.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +77,17 @@ class ServerActivity : FragmentActivity() {
         AppPreferences.setServerPort(this, port)
         AppPreferences.setLanEnabled(this, lan)
         AppPreferences.setApiKey(this, key)
+
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         LocalApiService.start(applicationContext, port, lan, key)
         Toast.makeText(this, "Starting web chat and API server...", Toast.LENGTH_SHORT).show()
         binding.root.postDelayed({ refreshUi() }, 300L)

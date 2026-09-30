@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ notification permission for the foreground API-server status notification. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Needed because GenieX native runtimes require direct filesystem paths for a user-selected persistent workspace. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
     <!-- Optional in-app camera capture for VLM image input. -->

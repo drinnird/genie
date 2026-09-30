@@ -3,13 +3,16 @@ package com.geniex.demo.server
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.pm.PackageManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.IBinder
+import android.os.Build
 import android.os.PowerManager
+import androidx.core.content.ContextCompat
 import com.geniex.demo.R
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.model.AppPreferences
@@ -118,10 +121,25 @@ class LocalApiService : Service() {
     private fun updateNotification() {
         val model = InferenceBridge.activeModelName ?: "No model loaded"
         val address = LocalApiServer.lanUrl() ?: LocalApiServer.localhostUrl()
-        getSystemService(NotificationManager::class.java).notify(
-            NOTIFICATION_ID,
-            buildNotification("$model - $address"),
-        )
+
+        // Android 13+ lets a foreground service run even when notification
+        // permission is denied, but ordinary NotificationManager.notify()
+        // calls still require POST_NOTIFICATIONS. startForeground() above is
+        // sufficient to satisfy the foreground-service contract; only update
+        // the visible notification when permission is available.
+        val canPostNotifications =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(
+                    this,
+                    android.Manifest.permission.POST_NOTIFICATIONS,
+                ) == PackageManager.PERMISSION_GRANTED
+
+        if (canPostNotifications) {
+            getSystemService(NotificationManager::class.java).notify(
+                NOTIFICATION_ID,
+                buildNotification("$model - $address"),
+            )
+        }
     }
 
     @Suppress("DEPRECATION")

@@ -206,3 +206,11 @@ It also fixes the two nullable compute-unit Kotlin type errors found in the v10 
 Static validation for this revision includes Android XML/JSON parsing, resource-ID/manifest-class checks,
 workflow YAML and shell syntax validation, Kotlin parser sweeps, and targeted compilation of the adaptive
 performance settings. GitHub Actions remains the authoritative Android `lintDebug` + `assembleDebug` build.
+
+
+## v12 build fix
+
+- Declares Android 13+ `POST_NOTIFICATIONS` permission for the foreground local API server.
+- Requests the permission when the user starts the server.
+- Keeps the foreground service functional if the user denies notification permission.
+- Guards subsequent `NotificationManager.notify()` updates with a runtime permission check, resolving the Android Lint `NotificationPermission` build failure without suppressing the rule.
