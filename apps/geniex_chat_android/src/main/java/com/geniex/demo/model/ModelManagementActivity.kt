@@ -95,7 +95,7 @@ class ModelManagementActivity : FragmentActivity() {
                     available = available,
                     persistentFilesPresent = persistentFilesPresent,
                     loaded = model.id == activeId,
-                    blockedByActiveModel = activeId != null && activeId != model.id,
+                    switchesActiveModel = activeId != null && activeId != model.id,
                     downloading = thisDownload && download.isRunning,
                     progress = if (thisDownload && download.isRunning) download.percent else old?.progress,
                     error = when {
@@ -149,10 +149,6 @@ class ModelManagementActivity : FragmentActivity() {
     private fun selectModel(model: ModelData) {
         val activeId = InferenceBridge.activeModelId
         val action = if (activeId == model.id) ACTION_UNLOAD else ACTION_LOAD
-        if (activeId != null && activeId != model.id) {
-            Toast.makeText(this, "Unload the active model before loading another one.", Toast.LENGTH_SHORT).show()
-            return
-        }
         AppPreferences.setSelectedModelId(this, model.id)
         setResult(
             Activity.RESULT_OK,
@@ -191,8 +187,12 @@ class ModelManagementActivity : FragmentActivity() {
             result.onSuccess { code ->
                 DiagnosticsLogger.checkpoint("MODEL_DELETE", "${model.modelName} rc=$code")
                 runOnUiThread {
-                    if (code == 0) Toast.makeText(this@ModelManagementActivity, "Model deleted.", Toast.LENGTH_SHORT).show()
-                    else Toast.makeText(this@ModelManagementActivity, "Delete failed (code $code).", Toast.LENGTH_LONG).show()
+                    if (code == 0) {
+                        AppPreferences.clearLastLoadedModelIfMatches(this@ModelManagementActivity, model.id)
+                        Toast.makeText(this@ModelManagementActivity, "Model deleted.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@ModelManagementActivity, "Delete failed (code $code).", Toast.LENGTH_LONG).show()
+                    }
                 }
             }.onFailure {
                 DiagnosticsLogger.log("ERROR", "ModelDelete", model.modelName, it)
