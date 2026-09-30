@@ -40,7 +40,7 @@ Qwen3.5 0.8B / 2B / 4B are loaded through the text-only LLM path by default to r
 
 On first launch this customized build asks you to select a shared-storage working folder (for example `Documents/GenieX`). The folder contains model weights, GenieX cache metadata, diagnostic logs/exports, attachments, and temporary files. Because it is shared storage, the files survive app uninstall. After reinstalling, select the same folder again to rediscover downloaded models.
 
-The app requests Android **All files access** for this feature because GenieX's native model runtimes consume ordinary filesystem paths rather than Storage Access Framework `content://` URIs. The application uses the selected workspace as `GENIEX_DATADIR` before initializing the SDK.
+The app requests Android **All files access** for this feature because GenieX's native model runtimes consume ordinary filesystem paths rather than Storage Access Framework `content://` URIs. The application initializes the GenieX model manager directly against the selected `Genie/` root before normal SDK initialization. As a result, the SDK's model store is `Genie/models/` and its AI Hub metadata cache is `Genie/aihub/`; these files remain in the shared workspace when the APK is uninstalled. `GENIEX_DATADIR` is also set to the same root for native components that consult the environment.
 
 ## Mobile memory and performance policy
 
@@ -62,6 +62,8 @@ not directly usable by that native path-based cache. Workspace setup is now
 recovery-safe: a stale or invalid saved path will return to the setup screen
 instead of crash-looping the application.
 
+
+Model downloads are verified after completion by resolving the path reported by `ModelManagerWrapper.getPaths()`. If the SDK ever reports a path outside `Genie/models/`, the app records that path in diagnostics and shows a storage-verification warning rather than silently implying the download is persistent.
 
 ## v15 web authentication and context management
 

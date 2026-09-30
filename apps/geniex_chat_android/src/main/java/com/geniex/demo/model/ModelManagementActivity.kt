@@ -145,9 +145,35 @@ class ModelManagementActivity : FragmentActivity() {
                             }
                         }
                         is ModelManagerWrapper.PullEvent.Completed -> {
-                            DiagnosticsLogger.checkpoint("MODEL_DOWNLOAD_COMPLETE", model.modelName)
-                            setState(model.id) { it.copy(available = true, downloading = false, progress = 100, error = null) }
-                            runOnUiThread { Toast.makeText(this@ModelManagementActivity, "${model.displayName} is ready.", Toast.LENGTH_SHORT).show() }
+                            val paths = ModelManagerWrapper.getPaths(model.modelName)
+                            val persistent = WorkingDirectoryManager.isPersistentModelPath(
+                                this@ModelManagementActivity,
+                                paths?.model_path,
+                            )
+                            DiagnosticsLogger.checkpoint(
+                                "MODEL_DOWNLOAD_COMPLETE",
+                                "${model.modelName} path=${paths?.model_path.orEmpty()} persistent=$persistent",
+                            )
+                            setState(model.id) {
+                                it.copy(
+                                    available = paths != null,
+                                    downloading = false,
+                                    progress = 100,
+                                    error = if (paths != null && !persistent) {
+                                        "Model downloaded outside Genie/models; export diagnostics before reinstalling."
+                                    } else {
+                                        null
+                                    },
+                                )
+                            }
+                            runOnUiThread {
+                                val message = if (persistent) {
+                                    "${model.displayName} is ready in Genie/models."
+                                } else {
+                                    "${model.displayName} downloaded, but storage verification failed."
+                                }
+                                Toast.makeText(this@ModelManagementActivity, message, if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
+                            }
                         }
                         is ModelManagerWrapper.PullEvent.Error -> {
                             DiagnosticsLogger.log("ERROR", "ModelDownload", "${model.modelName}: ${event.code} ${event.message}")
@@ -223,8 +249,10 @@ class ModelManagementActivity : FragmentActivity() {
             adapter.submitList(newStates)
             val available = newStates.count { it.available }
             val workspace = WorkingDirectoryManager.workspace(this@ModelManagementActivity)?.root?.absolutePath
+            val modelStorage = WorkingDirectoryManager.modelStoragePath(this@ModelManagementActivity)
             binding.tvModelStorageSummary.text = buildString {
                 append("$available of ${newStates.size} models available")
+                if (!modelStorage.isNullOrBlank()) append("\nModels: $modelStorage")
                 if (!workspace.isNullOrBlank()) append("\nWorkspace: $workspace")
             }
         }

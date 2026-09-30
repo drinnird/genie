@@ -7,7 +7,10 @@ import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.system.Os
 import com.geniex.demo.diagnostics.DiagnosticsLogger
+import com.geniex.sdk.GenieXSdk
+import com.geniex.sdk.ModelManagerWrapper
 import java.io.File
+import kotlinx.coroutines.runBlocking
 
 /**
  * Owns the persistent, user-selected GenieX workspace.
@@ -200,6 +203,15 @@ object WorkingDirectoryManager {
         Os.setenv("GENIEX_DATADIR", workspace.root.canonicalPath, true)
         DiagnosticsLogger.useWorkingDirectory(context, workspace.root)
 
+        // GenieX Android 0.3.5 does not consult GENIEX_DATADIR from
+        // GenieXSdk.init(); it explicitly initializes its model manager at
+        // context.filesDir/geniex. The native model-manager FFI is first-init
+        // wins, however, and ModelManagerWrapper exposes an explicit data-dir
+        // initializer. Prime it here with the persistent workspace BEFORE any
+        // Activity calls GenieXSdk.init(). The SDK's later private-path init
+        // then receives ALREADY_INITIALIZED and leaves this path intact.
+        primeModelManager(workspace)
+
         File(workspace.root, "README.txt").let { marker ->
             if (!marker.exists()) {
                 runCatching {
@@ -218,6 +230,46 @@ object WorkingDirectoryManager {
             }
         }
         return workspace
+    }
+
+    /**
+     * Initialize the SDK model store against the persistent Genie root.
+     *
+     * The store itself creates `models/` and `aihub/` under [Workspace.root],
+     * so passing the root here intentionally results in `Genie/models/...`.
+     */
+    private fun primeModelManager(workspace: Workspace) {
+        val dataDir = workspace.root.canonicalPath
+
+        // Loading the SDK singleton loads npu_jni without initializing the
+        // model manager. This makes the JNI methods safe to call directly via
+        // ModelManagerWrapper.init().
+        GenieXSdk.getInstance()
+
+        val result = runBlocking { ModelManagerWrapper.init(dataDir) }
+        result.getOrElse { error ->
+            throw IllegalStateException(
+                "Could not initialize the persistent GenieX model store at $dataDir",
+                error,
+            )
+        }
+
+        DiagnosticsLogger.log(
+            "INFO",
+            "Workspace",
+            "GenieX model store initialized dataDir=$dataDir models=${workspace.models.canonicalPath}",
+        )
+    }
+
+    fun modelStoragePath(context: Context): String? = workspace(context)?.models?.absolutePath
+
+    fun isPersistentModelPath(context: Context, path: String?): Boolean {
+        if (path.isNullOrBlank()) return false
+        val models = workspace(context)?.models ?: return false
+        return runCatching {
+            val modelsPath = models.canonicalFile.toPath()
+            File(path).canonicalFile.toPath().startsWith(modelsPath)
+        }.getOrDefault(false)
     }
 
     private fun workspaceFor(root: File): Workspace = Workspace(

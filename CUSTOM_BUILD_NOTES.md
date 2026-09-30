@@ -280,3 +280,13 @@ Fixed a runtime startup crash introduced by the transcript/UI refresh path:
 was initialized. The app now binds all composer/model/status views before any
 state refresh and adds defensive `lateinit`/Activity-lifecycle guards to the
 refresh helpers.
+
+## v19 persistent model-store fix
+
+- Fixes the actual Qualcomm Android model-cache initialization order. `GenieXSdk.init()` in the pinned Android SDK initializes the native model manager with `context.filesDir/geniex`; setting `GENIEX_DATADIR` alone does not override that explicit path.
+- Workspace setup now loads the GenieX JNI bridge and calls `ModelManagerWrapper.init(<selected Genie root>)` before any Activity calls `GenieXSdk.init()`.
+- The native model store is first-initialization-wins, so the later SDK initialization receives its already-initialized result and keeps the persistent workspace instead of switching to app-private storage.
+- The model manager receives the `Genie/` root, intentionally placing model data under `Genie/models/` and AI Hub metadata under `Genie/aihub/` using the SDK's own normal directory layout.
+- Model-download completion now resolves the SDK-reported model path and verifies that it is physically inside `Genie/models/`; diagnostics record the resolved path and verification result.
+- The Models screen now shows the exact model-storage path in addition to the workspace root.
+- No legacy private-model migration is included because this revision follows a clean reinstall; previous app-private files are not assumed to exist.

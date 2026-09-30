@@ -89,3 +89,7 @@ root of this repository.
 
 The GenieX SDK dependency is released under its own license. Refer to the
 [GenieX repository](https://github.com/qualcomm/geniex) for details.
+
+## Custom persistent model storage
+
+This customized build initializes the GenieX model manager with the user-selected shared `Genie/` workspace **before** the normal `GenieXSdk.init()` call. The SDK therefore stores downloaded weights under `Genie/models/` and AI Hub cache data under `Genie/aihub/` rather than under the APK's private `filesDir/geniex` directory. The Models screen displays the resolved storage path and download completion verifies the SDK-reported model path is inside `Genie/models/`.

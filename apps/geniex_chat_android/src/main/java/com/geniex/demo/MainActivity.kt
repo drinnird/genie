@@ -975,13 +975,26 @@ class MainActivity : FragmentActivity() {
                             }
 
                             is ModelManagerWrapper.PullEvent.Completed -> {
+                                val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)
+                                val persistent = WorkingDirectoryManager.isPersistentModelPath(
+                                    this@MainActivity,
+                                    paths?.model_path,
+                                )
+                                DiagnosticsLogger.checkpoint(
+                                    "MODEL_DOWNLOAD_COMPLETE",
+                                    "${selectModelData.modelName} path=${paths?.model_path.orEmpty()} persistent=$persistent",
+                                )
                                 runOnUiThread {
                                     llDownloading.visibility = View.GONE
                                     Toast
                                         .makeText(
                                             this@MainActivity,
-                                            "${selectModelData.displayName} downloaded",
-                                            Toast.LENGTH_SHORT,
+                                            if (persistent) {
+                                                "${selectModelData.displayName} downloaded to Genie/models"
+                                            } else {
+                                                "Download finished, but model storage verification failed"
+                                            },
+                                            if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
                                         ).show()
                                 }
                             }
