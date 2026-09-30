@@ -1,6 +1,7 @@
 package com.geniex.demo.server
 
 import android.content.Context
+import android.os.SystemClock
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -27,14 +28,16 @@ import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 object LocalApiServer {
-    private const val MAX_BODY_BYTES = 1024 * 1024
+    private const val MAX_BODY_BYTES = 512 * 1024
     private const val DEFAULT_MAX_TOKENS = 2048
+    private const val API_WORKER_THREADS = 4
     private val running = AtomicBoolean(false)
-    private val executor = Executors.newFixedThreadPool(6)
+    @Volatile private var executor: ExecutorService? = null
     private val apiInferenceBusy = AtomicBoolean(false)
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -53,6 +56,12 @@ object LocalApiServer {
 
     fun isRunning(): Boolean = running.get()
 
+    /** Release recreatable server-side caches when Android reports memory pressure. */
+    fun trimMemory() {
+        cachedWebUi = null
+        DiagnosticsLogger.log("INFO", "ApiServer", "released web UI cache for memory pressure")
+    }
+
     @Synchronized
     fun start(context: Context, port: Int, lanEnabled: Boolean, apiKey: String): Result<Unit> {
         if (running.get()) stop()
@@ -67,6 +76,9 @@ object LocalApiServer {
             serverSocket = socket
             lastError = null
             apiInferenceBusy.set(false)
+            executor = Executors.newFixedThreadPool(API_WORKER_THREADS) { runnable ->
+                Thread(runnable, "GenieX-ApiWorker").apply { isDaemon = true }
+            }
             running.set(true)
             Thread({ acceptLoop(socket) }, "GenieX-ApiAccept").apply {
                 isDaemon = true
@@ -87,7 +99,11 @@ object LocalApiServer {
         apiInferenceBusy.set(false)
         runCatching { serverSocket?.close() }
         serverSocket = null
-        DiagnosticsLogger.log("INFO", "ApiServer", "stopped")
+        executor?.shutdownNow()
+        executor = null
+        cachedWebUi = null
+        appContext = null
+        DiagnosticsLogger.log("INFO", "ApiServer", "stopped and released worker pool")
     }
 
     fun localhostUrl(): String = "http://127.0.0.1:$port"
@@ -103,7 +119,12 @@ object LocalApiServer {
             try {
                 val client = socket.accept()
                 client.tcpNoDelay = true
-                executor.execute { handleClient(client) }
+                val pool = executor
+                if (pool == null || pool.isShutdown) {
+                    client.close()
+                } else {
+                    pool.execute { handleClient(client) }
+                }
             } catch (e: Exception) {
                 if (running.get()) {
                     lastError = e.message
@@ -243,13 +264,17 @@ object LocalApiServer {
         writeSseHeaders(output)
         writeSseData(output, chatChunkJson(id, model, created, role = "assistant"))
 
+        val chunks = TokenChunker { text ->
+            writeSseData(output, chatChunkJson(id, model, created, content = text))
+        }
         val result = runBlocking {
             InferenceBridge.streamText(messages, enableThinking, maxTokens) { token ->
-                writeSseData(output, chatChunkJson(id, model, created, content = token))
+                chunks.append(token)
             }
         }
         result.fold(
             onSuccess = {
+                chunks.flush()
                 writeSseData(output, chatChunkJson(id, model, created, finishReason = "stop"))
                 writeSseDone(output)
             },
@@ -288,13 +313,15 @@ object LocalApiServer {
         try {
         if (stream) {
             writeSseHeaders(output)
+            val chunks = TokenChunker { text ->
+                writeSseData(output, completionChunkJson(id, model, created, text))
+            }
             val result = runBlocking {
-                InferenceBridge.streamPrompt(prompt, maxTokens) { token ->
-                    writeSseData(output, completionChunkJson(id, model, created, token))
-                }
+                InferenceBridge.streamPrompt(prompt, maxTokens) { token -> chunks.append(token) }
             }
             result.fold(
                 onSuccess = {
+                    chunks.flush()
                     writeSseData(output, completionChunkJson(id, model, created, "", finishReason = "stop"))
                     writeSseDone(output)
                 },
@@ -705,6 +732,30 @@ object LocalApiServer {
         }
         null
     }.getOrNull()
+
+    private class TokenChunker(private val emit: (String) -> Unit) {
+        private val buffer = StringBuilder(SSE_FLUSH_CHARS * 2)
+        private var lastFlushMs = SystemClock.elapsedRealtime()
+
+        fun append(token: String) {
+            buffer.append(token)
+            val now = SystemClock.elapsedRealtime()
+            if (buffer.length >= SSE_FLUSH_CHARS || now - lastFlushMs >= SSE_FLUSH_MS) flush(now)
+        }
+
+        fun flush() = flush(SystemClock.elapsedRealtime())
+
+        private fun flush(now: Long) {
+            if (buffer.isEmpty()) return
+            val text = buffer.toString()
+            buffer.setLength(0)
+            lastFlushMs = now
+            emit(text)
+        }
+    }
+
+    private const val SSE_FLUSH_CHARS = 96
+    private const val SSE_FLUSH_MS = 50L
 
     private const val FALLBACK_WEB_UI = """<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>GenieX Local</title></head><body><h1>GenieX Local</h1><p>The bundled web chat UI could not be loaded. The API remains available at <code>/v1</code>.</p></body></html>"""
 }

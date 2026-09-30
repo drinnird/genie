@@ -5,9 +5,11 @@
 package com.geniex.demo
 
 import android.app.Application
+import android.content.ComponentCallbacks2
 import android.util.Log
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.storage.WorkingDirectoryManager
+import com.geniex.demo.server.LocalApiServer
 import java.io.File
 
 class MyApplication : Application() {
@@ -19,6 +21,20 @@ class MyApplication : Application() {
         // services and restored activities inherit the same GenieX model cache.
         WorkingDirectoryManager.applyConfigured(this)
         clearLegacyModelsDir()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        DiagnosticsLogger.log("INFO", TAG, "onTrimMemory level=$level")
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW || level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            LocalApiServer.trimMemory()
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        DiagnosticsLogger.log("WARN", TAG, "onLowMemory")
+        LocalApiServer.trimMemory()
     }
 
     private fun clearLegacyModelsDir() {

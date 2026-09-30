@@ -175,3 +175,34 @@ Android removes app preferences and URI grants on uninstall. The shared workspac
 - On the next launch, the most recent Android `ApplicationExitInfo` is correlated with the last persisted model-load stage.
 - Exported diagnostic ZIPs include all of the above plus current logcat and process-exit traces.
 - Prompt/response bodies and API credentials are not intentionally logged by app-level diagnostics. Native SDK log output is captured as emitted by the SDK/runtime.
+
+## v11 Android memory / performance hardening
+
+This revision is focused on reducing peak allocations and long-session memory growth on phones.
+It also fixes the two nullable compute-unit Kotlin type errors found in the v10 GitHub Actions log.
+
+- GGUF llama.cpp loads use conservative mobile settings instead of the SDK's larger defaults:
+  `nCtx=1024`, adaptive `nBatch=128/256`, `nUBatch=64/128`, and host thread counts capped at 6.
+  The smaller batch is selected when Android reports under 4 GiB of currently available RAM.
+- Model loading refuses to start while Android is already reporting `lowMemory` pressure.
+- CPU, GPU and NPU model loads retain the existing preflight / clean-process switching safeguards.
+- Removed explicit `System.gc()` from model switching. Native/driver allocations are not Java-heap
+  objects, and forced GC can add long pauses without releasing accelerator memory.
+- Native chat history, API history, output token counts, and the visible Android transcript are bounded
+  so long sessions cannot retain an ever-growing object graph.
+- API request bodies are capped at 512 KiB and API responses are capped at 4096 generated tokens.
+- SSE output is coalesced into short chunks instead of allocating/flushing JSON for every token.
+- Streaming chat updates are throttled to ~80 ms and use RecyclerView payload updates; Markdown is
+  rendered once when generation finishes rather than reparsed on every token.
+- Markwon is shared per adapter instead of constructed for every assistant ViewHolder.
+- Image attachment preprocessing uses sampled decoding before EXIF rotation/crop, JPEG quality 90,
+  and chat thumbnails use sampled RGB_565 decoding rather than full-resolution bitmaps.
+- Coroutine work is tied to a `SupervisorJob` and cancelled when MainActivity is destroyed.
+- The API worker executor and cached web UI are released when the server stops or Android reports
+  memory pressure. The pool is intentionally small (4 workers) because model inference itself is serialized.
+- Diagnostics' high-frequency timestamp/proc parsing was tightened to reduce allocation overhead while
+  preserving the 500 ms model-load memory trace.
+
+Static validation for this revision includes Android XML/JSON parsing, resource-ID/manifest-class checks,
+workflow YAML and shell syntax validation, Kotlin parser sweeps, and targeted compilation of the adaptive
+performance settings. GitHub Actions remains the authoritative Android `lintDebug` + `assembleDebug` build.

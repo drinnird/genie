@@ -55,6 +55,19 @@ object DiagnosticsLogger {
     @Volatile private var lastNativeLogLine: String? = null
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
 
+    // SimpleDateFormat is expensive to allocate and not thread-safe. One formatter
+    // per logging thread avoids repeated allocation during 500 ms load monitoring.
+    private val isoFormatter = ThreadLocal.withInitial {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).apply {
+            timeZone = TimeZone.getDefault()
+        }
+    }
+    private val fileFormatter = ThreadLocal.withInitial {
+        SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).apply {
+            timeZone = TimeZone.getDefault()
+        }
+    }
+
     fun init(context: Context) {
         appContext = context.applicationContext
         configureLogDirectory(File(appContext.filesDir, "diagnostics/logs"))
@@ -431,7 +444,9 @@ object DiagnosticsLogger {
                 if (colon <= 0) return@forEach
                 val key = line.substring(0, colon)
                 if (key !in wanted) return@forEach
-                val number = line.substring(colon + 1).trim().split(Regex("\\s+"))[0].toLongOrNull()
+                val value = line.substring(colon + 1).trimStart()
+                val digits = value.takeWhile { it.isDigit() }
+                val number = digits.toLongOrNull()
                 if (number != null) result[key] = number
             }
         }
@@ -618,10 +633,7 @@ object DiagnosticsLogger {
         else -> "OTHER"
     }
 
-    private fun isoTimestamp(): String =
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).apply {
-            timeZone = TimeZone.getDefault()
-        }.format(Date())
+    private fun isoTimestamp(): String = isoFormatter.get()!!.format(Date())
 
-    private fun fileTimestamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+    private fun fileTimestamp(): String = fileFormatter.get()!!.format(Date())
 }

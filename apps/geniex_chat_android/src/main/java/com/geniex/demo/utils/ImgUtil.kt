@@ -129,6 +129,7 @@ class ImgUtil {
             imageFile: File,
             outFile: File,
             size: Int = 448,
+            quality: Int = 90,
         ): File {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(imageFile.absolutePath, bounds)
@@ -147,7 +148,30 @@ class ImgUtil {
                         }
                     inPreferredConfig = Bitmap.Config.ARGB_8888
                 }
-            val bmp = BitmapFactory.decodeFile(imageFile.absolutePath, opts) ?: error("decode fail")
+            var bmp = BitmapFactory.decodeFile(imageFile.absolutePath, opts) ?: error("decode fail")
+
+            // Apply EXIF orientation after sampled decode so portrait photos do
+            // not require a second full-resolution bitmap in memory.
+            val exif = ExifInterface(imageFile.absolutePath)
+            val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            val matrix = Matrix().apply {
+                when (orientation) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> postRotate(90f)
+                    ExifInterface.ORIENTATION_ROTATE_180 -> postRotate(180f)
+                    ExifInterface.ORIENTATION_ROTATE_270 -> postRotate(270f)
+                    ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> postScale(-1f, 1f)
+                    ExifInterface.ORIENTATION_FLIP_VERTICAL -> postScale(1f, -1f)
+                    ExifInterface.ORIENTATION_TRANSPOSE -> { postRotate(90f); postScale(-1f, 1f) }
+                    ExifInterface.ORIENTATION_TRANSVERSE -> { postRotate(270f); postScale(-1f, 1f) }
+                }
+            }
+            if (!matrix.isIdentity) {
+                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                if (rotated !== bmp) {
+                    bmp.recycle()
+                    bmp = rotated
+                }
+            }
 
             // Scale so the shorter edge lands exactly on `size`; the longer edge
             // overflows and is trimmed by the centre-crop below.
@@ -173,7 +197,7 @@ class ImgUtil {
             if (cropped !== scaled) scaled.recycle()
 
             FileOutputStream(outFile).use { fos ->
-                cropped.compress(Bitmap.CompressFormat.JPEG, 100, fos)
+                cropped.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(70, 95), fos)
             }
             if (!cropped.isRecycled) cropped.recycle()
             return outFile

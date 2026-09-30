@@ -136,7 +136,12 @@ class ModelManagementActivity : FragmentActivity() {
                             val total = event.files.sumOf { it.total_bytes }
                             val done = event.files.sumOf { it.downloaded_bytes }
                             val progress = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
-                            setState(model.id) { it.copy(downloading = true, progress = progress, error = null) }
+                            // Pull events can arrive much more frequently than the visible
+                            // percentage changes. Avoid allocating/submitting a new list for
+                            // duplicate progress values.
+                            if (states.firstOrNull { it.model.id == model.id }?.progress != progress) {
+                                setState(model.id) { it.copy(downloading = true, progress = progress, error = null) }
+                            }
                         }
                         is ModelManagerWrapper.PullEvent.Completed -> {
                             DiagnosticsLogger.checkpoint("MODEL_DOWNLOAD_COMPLETE", model.modelName)

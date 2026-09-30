@@ -11,8 +11,6 @@ import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -22,6 +20,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.LayoutInflater
@@ -85,6 +84,8 @@ import com.gyf.immersionbar.ktx.immersionBar
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -96,6 +97,7 @@ import java.util.Locale
 class MainActivity : FragmentActivity() {
     private val binding: ActivityMainBinding by inflate()
     private var downloadJob: Job? = null
+    private var modelLoadJob: Job? = null
     private var downloadingModelData: ModelData? = null
     private lateinit var llDownloading: LinearLayout
     private lateinit var tvDownloadProgress: TextView
@@ -128,7 +130,7 @@ class MainActivity : FragmentActivity() {
 
     private lateinit var llmWrapper: LlmWrapper
     private lateinit var vlmWrapper: VlmWrapper
-    private val modelScope = CoroutineScope(Dispatchers.IO)
+    private val modelScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val chatList = arrayListOf<ChatMessage>()
     private val vlmChatList = arrayListOf<VlmChatMessage>()
@@ -151,6 +153,8 @@ class MainActivity : FragmentActivity() {
     private val savedImageFiles = mutableListOf<File>()
     private val messages = arrayListOf<Message>()
     private var loadingMessageIndex: Int = -1
+    private var streamingMessageIndex: Int = -1
+    private var lastStreamUiUpdateMs: Long = 0L
     private var sdkReady = false
     private var uiReady = false
     private var nativeRuntimeWasUsed = false
@@ -542,15 +546,19 @@ class MainActivity : FragmentActivity() {
         deviceId: String? = null,
         bypassFreshRuntimeGuard: Boolean = false,
     ) {
-        val requestedCompute = deviceId ?: ComputeUnitValue.NPU.value
+        val requestedCompute: String = deviceId ?: ComputeUnitValue.NPU.value ?: "npu"
         if (nativeRuntimeWasUsed && !bypassFreshRuntimeGuard && !hasLoadedModel()) {
             restartIntoFreshRuntime(selectModelData, requestedCompute)
+            return
+        }
+        if (modelLoadJob?.isActive == true) {
+            Toast.makeText(this, "A model is already loading.", Toast.LENGTH_SHORT).show()
             return
         }
         DiagnosticsLogger.markModelLoadStart(
             "model=${selectModelData.modelName} quant=${selectModelData.quant.orEmpty()} runtime=${selectModelData.runtime.orEmpty()} compute=$requestedCompute",
         )
-        modelScope.launch {
+        val loadJob = modelScope.launch {
             DiagnosticsLogger.modelLoadStage("RESET_LOAD_STATE_BEGIN")
             resetLoadState()
             DiagnosticsLogger.modelLoadStage("RESET_LOAD_STATE_COMPLETE")
@@ -576,18 +584,33 @@ class MainActivity : FragmentActivity() {
                 mmprojPath = paths.mmproj_path,
             )
 
-            val availableBytes = getAvailableMemoryBytes()
+            val memoryInfo = ActivityManager.MemoryInfo().also {
+                (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it)
+            }
+            val availableBytes = memoryInfo.availMem
             val modelBytes = recursiveSizeBytes(File(paths.model_path))
             DiagnosticsLogger.log(
                 "INFO",
                 "Memory",
                 "load preflight model=${selectModelData.displayName} runtime=${paths.runtime_id.ifEmpty { modelDataPluginId }} " +
-                    "compute=$requestedCompute available=${formatGiB(availableBytes)} modelFiles=${formatGiB(modelBytes)}",
+                    "compute=$requestedCompute available=${formatGiB(availableBytes)} modelFiles=${formatGiB(modelBytes)} " +
+                    "lowMemory=${memoryInfo.lowMemory} threshold=${formatGiB(memoryInfo.threshold)}",
             )
             DiagnosticsLogger.modelLoadStage(
                 "MEMORY_PREFLIGHT_COMPLETE",
                 "availableBytes=$availableBytes modelBytes=$modelBytes",
             )
+            if (memoryInfo.lowMemory) {
+                DiagnosticsLogger.modelLoadStage(
+                    "MEMORY_PREFLIGHT_BLOCKED",
+                    "availableBytes=$availableBytes threshold=${memoryInfo.threshold} reason=android_low_memory",
+                )
+                onLoadModelFailed(
+                    "Android is already reporting low-memory pressure. Close other apps or reboot before loading a model.",
+                )
+                return@launch
+            }
+
             selectModelData.minAvailableMemoryGiB?.let { minGiB ->
                 val minimumBytes = (minGiB * GIB_BYTES.toDouble()).toLong()
                 if (availableBytes > 0L && availableBytes < minimumBytes) {
@@ -656,20 +679,29 @@ class MainActivity : FragmentActivity() {
                     // time in the AI Hub bundle) — and the Kotlin ModelConfig defaults
                     // are non-zero, so zero them explicitly for the qairt path.
                     val isQairt = pluginId == "qairt"
+                    val llamaTuning = if (isQairt) null else PerformanceTuning.llamaConfig(availableBytes, requestedCompute)
                     val conf =
                         if (isQairt) {
                             ModelConfig(nCtx = 0, nGpuLayers = 0, enable_thinking = enableThinking)
                         } else {
                             ModelConfig(
-                                nCtx = 1024,
+                                nCtx = llamaTuning!!.nCtx,
+                                nThreads = llamaTuning.nThreads,
+                                nBatch = llamaTuning.nBatch,
+                                nUBatch = llamaTuning.nUBatch,
                                 nGpuLayers = nGpuLayers,
                                 enable_thinking = enableThinking,
                             )
                         }
                     DiagnosticsLogger.modelLoadStage(
                         "LLM_CONFIG_READY",
-                        "runtime=$pluginId compute=${resolvedDeviceId ?: ComputeUnitValue.NPU.value} " +
-                            "nCtx=${if (isQairt) 0 else 1024} nGpuLayers=${if (isQairt) 0 else nGpuLayers} thinking=$enableThinking",
+                        if (isQairt) {
+                            "runtime=$pluginId compute=$requestedCompute nCtx=0 nGpuLayers=0 thinking=$enableThinking"
+                        } else {
+                            "runtime=$pluginId compute=$requestedCompute nCtx=${llamaTuning!!.nCtx} " +
+                                "nThreads=${llamaTuning.nThreads} nBatch=${llamaTuning.nBatch} " +
+                                "nUBatch=${llamaTuning.nUBatch} nGpuLayers=$nGpuLayers thinking=$enableThinking"
+                        },
                     )
                     DiagnosticsLogger.modelLoadStage("LLM_BUILDER_CREATE_BEGIN")
                     val builder = LlmWrapper.builder()
@@ -680,7 +712,7 @@ class MainActivity : FragmentActivity() {
                         tokenizer_path = paths.tokenizer_path,
                         config = conf,
                         runtime_id = pluginId,
-                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
+                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value ?: "npu",
                     )
                     DiagnosticsLogger.modelLoadStage("LLM_CREATE_INPUT_BEGIN")
                     val configuredBuilder = builder.llmCreateInput(createInput)
@@ -754,7 +786,7 @@ class MainActivity : FragmentActivity() {
                         mmproj_path = paths.mmproj_path,
                         config = config,
                         runtime_id = pluginId,
-                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
+                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value ?: "npu",
                     )
                     DiagnosticsLogger.modelLoadStage("VLM_CREATE_INPUT_BEGIN")
                     val configuredBuilder = builder.vlmCreateInput(createInput)
@@ -782,6 +814,10 @@ class MainActivity : FragmentActivity() {
                     onLoadModelFailed("model type error")
                 }
             }
+        }
+        modelLoadJob = loadJob
+        loadJob.invokeOnCompletion {
+            if (modelLoadJob === loadJob) modelLoadJob = null
         }
     }
 
@@ -986,6 +1022,8 @@ class MainActivity : FragmentActivity() {
                 return@setOnClickListener
             }
             isGenerating = true
+            streamingMessageIndex = -1
+            lastStreamUiUpdateMs = 0L
             DiagnosticsLogger.checkpoint("INFERENCE_BEGIN", "model=${InferenceBridge.activeModelName.orEmpty()}")
             refreshSendButtonState()
 
@@ -1040,6 +1078,7 @@ class MainActivity : FragmentActivity() {
                         clearImages()
                         val sendMsg = VlmChatMessage(role = "user", contents = contents)
                         vlmChatList.add(sendMsg)
+                        trimVlmHistoryForMemory()
 
                         Log.d(TAG, "applying VLM chat template; turns=${vlmChatList.size}")
                         vlmWrapper
@@ -1076,6 +1115,7 @@ class MainActivity : FragmentActivity() {
                             }
                     } else {
                         chatList.add(ChatMessage(role = "user", inputString))
+                        trimLlmHistoryForMemory()
                         // Apply chat template and generate
                         llmWrapper
                             .applyChatTemplate(
@@ -1215,7 +1255,6 @@ class MainActivity : FragmentActivity() {
         // GenieX may release large native / driver allocations asynchronously.
         // Give those allocations a short chance to drain before the user swaps
         // from NPU to GPU (or vice versa), which reduces transient peak memory.
-        System.gc()
         delay(MODEL_UNLOAD_SETTLE_MS)
         DiagnosticsLogger.log(
             "INFO",
@@ -1305,26 +1344,16 @@ class MainActivity : FragmentActivity() {
     ) {
         when (streamResult) {
             is LlmStreamResult.Token -> {
-                removeLoadingIndicator()
-                runOnUiThread {
-                    sb.append(streamResult.text)
-                    Message(sb.toString(), MessageType.ASSISTANT).let { lastMsg ->
-                        val size = messages.size
-                        messages[size - 1].let { msg ->
-                            if (msg.type != MessageType.ASSISTANT) {
-                                messages.add(lastMsg)
-                            } else {
-                                messages[size - 1] = lastMsg
-                            }
-                        }
-                    }
-                    adapter.notifyDataSetChanged()
+                sb.append(streamResult.text)
+                val now = SystemClock.uptimeMillis()
+                if (now - lastStreamUiUpdateMs >= STREAM_UI_UPDATE_MS) {
+                    lastStreamUiUpdateMs = now
+                    postStreamingAssistantText(sb.toString(), finalRender = false)
                 }
-                // Do not write generated text to logcat; exported diagnostics must not leak chats.
             }
 
             is LlmStreamResult.Completed -> {
-                removeLoadingIndicator()
+                postStreamingAssistantText(sb.toString(), finalRender = true)
                 if (isLoadVlmModel) {
                     vlmChatList.add(
                         VlmChatMessage(
@@ -1332,33 +1361,26 @@ class MainActivity : FragmentActivity() {
                             listOf(VlmContent("text", sb.toString())),
                         ),
                     )
+                    trimVlmHistoryForMemory()
                 } else {
                     chatList.add(ChatMessage("assistant", sb.toString()))
+                    trimLlmHistoryForMemory()
                 }
 
                 runOnUiThread {
-                    val content = sb.toString()
-                    val size = messages.size
-                    messages[size - 1] = Message(content, MessageType.ASSISTANT)
-
                     val ttft = String.format(Locale.US, "%.2f", streamResult.profile.ttftMs)
                     val promptTokens = streamResult.profile.promptTokens
-                    val prefillSpeed =
-                        String.format(Locale.US, "%.2f", streamResult.profile.prefillSpeed)
-
+                    val prefillSpeed = String.format(Locale.US, "%.2f", streamResult.profile.prefillSpeed)
                     val generatedTokens = streamResult.profile.generatedTokens
-                    val decodingSpeed =
-                        String.format(Locale.US, "%.2f", streamResult.profile.decodingSpeed)
-
+                    val decodingSpeed = String.format(Locale.US, "%.2f", streamResult.profile.decodingSpeed)
                     val profileData =
                         "TTFT: $ttft ms; Prompt Tokens: $promptTokens; \nPrefilling Speed: $prefillSpeed tok/s\nGenerated Tokens: $generatedTokens; Decoding Speed: $decodingSpeed tok/s"
-                    messages.add(
-                        Message(
-                            profileData,
-                            MessageType.PROFILE,
-                        ),
-                    )
-                    reloadRecycleView()
+                    messages.add(Message(profileData, MessageType.PROFILE))
+                    adapter.notifyItemInserted(messages.lastIndex)
+                    binding.rvChat.scrollToPosition(messages.lastIndex)
+                    streamingMessageIndex = -1
+                    trimUiTranscriptForMemory()
+                    if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
                 }
                 Log.d(TAG, "Completed: ${streamResult.profile}")
             }
@@ -1368,10 +1390,54 @@ class MainActivity : FragmentActivity() {
                 runOnUiThread {
                     val reason = streamResult.throwable.message ?: streamResult.throwable.toString()
                     messages.add(Message("Error: $reason", MessageType.PROFILE))
-                    reloadRecycleView()
+                    adapter.notifyItemInserted(messages.lastIndex)
+                    streamingMessageIndex = -1
+                    trimUiTranscriptForMemory()
+                    if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
                 }
                 Log.d(TAG, "Error: $streamResult")
             }
+        }
+    }
+
+    private fun postStreamingAssistantText(content: String, finalRender: Boolean) {
+        runOnUiThread {
+            removeLoadingIndicatorOnMainThread()
+            val idx = streamingMessageIndex
+            if (idx < 0 || idx >= messages.size || messages[idx].type != MessageType.ASSISTANT) {
+                messages.add(Message(content, MessageType.ASSISTANT))
+                streamingMessageIndex = messages.lastIndex
+                adapter.notifyItemInserted(streamingMessageIndex)
+            } else {
+                messages[idx] = Message(content, MessageType.ASSISTANT)
+                if (finalRender) {
+                    adapter.notifyItemChanged(idx)
+                } else {
+                    adapter.notifyItemChanged(idx, ChatAdapter.PAYLOAD_STREAM_TEXT)
+                }
+            }
+            binding.rvChat.scrollToPosition(messages.lastIndex)
+        }
+    }
+
+    private fun trimLlmHistoryForMemory() {
+        while (chatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
+            chatList.sumOf { it.content.length } > PerformanceTuning.MAX_NATIVE_HISTORY_CHARS
+        ) {
+            if (chatList.isEmpty()) break
+            chatList.removeAt(0)
+        }
+    }
+
+    private fun trimVlmHistoryForMemory() {
+        fun chars(): Int = vlmChatList.sumOf { message ->
+            message.contents.sumOf { content -> if (content.type == "text") content.text?.length ?: 0 else 0 }
+        }
+        while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
+            chars() > PerformanceTuning.MAX_NATIVE_HISTORY_CHARS
+        ) {
+            if (vlmChatList.isEmpty()) break
+            vlmChatList.removeAt(0)
         }
     }
 
@@ -1409,86 +1475,80 @@ class MainActivity : FragmentActivity() {
         data: Intent?,
     ) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != Activity.RESULT_OK) return
 
-        var bitmap: Bitmap? = null
-        if (requestCode == 1) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                val inputStream = contentResolver.openInputStream(data.data!!)
-                bitmap = BitmapFactory.decodeStream(inputStream)
-            }
-        } else if (requestCode == 1001 && resultCode == Activity.RESULT_OK) {
-            photoFile?.let {
-                bitmap = BitmapFactory.decodeFile(it.absolutePath)
-            }
-        }
-
-        bitmap?.let {
+        modelScope.launch {
+            var sourceFile: File? = null
+            val deleteSourceAfter = requestCode == 1 || requestCode == 1001
             try {
-                val attachmentsDir = WorkingDirectoryManager.workspace(this)?.attachments ?: filesDir
-                attachmentsDir.mkdirs()
-                val file = File(attachmentsDir, "chat_${System.currentTimeMillis()}.jpg")
-                val success = saveBitmapToFile(it, file)
-                if (success) {
-                    Log.d(TAG, "Save success: ${file.absolutePath}")
-                    savedImageFiles.add(file)
-                    refreshTopScrollContainer()
-                } else {
-                    Toast.makeText(this, "Save Image failed", Toast.LENGTH_SHORT).show()
+                sourceFile = when (requestCode) {
+                    1 -> {
+                        val uri = data?.data ?: return@launch
+                        val tempDir = (WorkingDirectoryManager.workspace(this@MainActivity)?.temp
+                            ?: File(filesDir, "tmp")).apply { mkdirs() }
+                        val temp = File(tempDir, "import_${System.currentTimeMillis()}.img")
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            temp.outputStream().buffered().use { output -> input.copyTo(output, 128 * 1024) }
+                        } ?: return@launch
+                        temp
+                    }
+                    1001 -> photoFile
+                    else -> null
                 }
-            } catch (e: FileNotFoundException) {
-                Log.e(TAG, "save image failed", e)
+                val source = sourceFile ?: return@launch
+                if (!source.exists()) return@launch
+
+                val attachmentsDir = WorkingDirectoryManager.workspace(this@MainActivity)?.attachments ?: filesDir
+                attachmentsDir.mkdirs()
+                val outputFile = File(attachmentsDir, "chat_${System.currentTimeMillis()}.jpg")
+                ImgUtil.squareCrop(
+                    imageFile = source,
+                    outFile = outputFile,
+                    size = vlmVisionConfig?.imageSize ?: FALLBACK_VLM_IMAGE_SIZE,
+                    quality = 90,
+                )
+                savedImageFiles.add(outputFile)
+                runOnUiThread { refreshTopScrollContainer() }
+            } catch (e: Exception) {
+                DiagnosticsLogger.log("ERROR", TAG, "image preprocessing failed", e)
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Could not prepare image: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                if (deleteSourceAfter) {
+                    runCatching { sourceFile?.delete() }
+                }
             }
         }
     }
 
-    private fun saveBitmapToFile(
-        bitmap: Bitmap,
-        file: File,
-    ): Boolean =
-        try {
-            val tempDir = (WorkingDirectoryManager.workspace(this)?.temp ?: File(this.filesDir, "tmp"))
-                .apply { if (!exists()) mkdirs() }
-
-            val tempFile =
-                File(
-                    tempDir,
-                    "tmp_${System.currentTimeMillis()}.jpg",
-                )
-            FileOutputStream(tempFile).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, out)
-            }
-
-            // Crop straight from the full-size temp file. Pre-downscaling on the
-            // *longest* edge first would leave the shorter edge under the target
-            // (e.g. 448x355), forcing squareCrop to upscale it back — two lossy
-            // resamples for a softer result. squareCrop samples down internally.
-            ImgUtil.squareCrop(
-                imageFile = tempFile,
-                outFile = file,
-                size = vlmVisionConfig?.imageSize ?: FALLBACK_VLM_IMAGE_SIZE,
-            )
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "saveBitmapToFile failed", e)
-            false
-        }
-
     private fun clearHistory() {
-        if (isLoadLlmModel) {
+        if (!hasLoadedModel()) {
             chatList.clear()
-            modelScope.launch {
-                llmWrapper.reset()
-            }
-        }
-        if (isLoadVlmModel) {
             vlmChatList.clear()
-            modelScope.launch {
-                vlmWrapper.reset()
-            }
+            messages.clear()
+            clearImages()
+            reloadRecycleView()
+            return
         }
+        if (!InferenceBridge.mutex.tryLock()) {
+            Toast.makeText(this, "Model is busy. Clear the chat after generation finishes.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        chatList.clear()
+        vlmChatList.clear()
         messages.clear()
         clearImages()
         reloadRecycleView()
+        modelScope.launch {
+            try {
+                if (isLoadLlmModel) llmWrapper.reset()
+                if (isLoadVlmModel) vlmWrapper.reset()
+            } finally {
+                if (InferenceBridge.mutex.isLocked) InferenceBridge.mutex.unlock()
+            }
+        }
     }
 
     private var popupWindow: PopupWindow? = null
@@ -1603,9 +1663,35 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    /** Keep the visible transcript bounded so long sessions do not retain an
+     * ever-growing graph of message strings, spans and image-row views. Native
+     * model history is bounded separately in trimLlmHistoryForMemory()/
+     * trimVlmHistoryForMemory().
+     */
+    private fun trimUiTranscriptForMemory() {
+        var removed = 0
+        fun chars(): Int = messages.sumOf { it.content.length }
+        while (messages.size > PerformanceTuning.MAX_UI_MESSAGES ||
+            (messages.size > 2 && chars() > PerformanceTuning.MAX_UI_CHARS)
+        ) {
+            messages.removeAt(0)
+            removed += 1
+        }
+        if (removed <= 0) return
+
+        if (loadingMessageIndex >= 0) loadingMessageIndex = (loadingMessageIndex - removed).coerceAtLeast(-1)
+        if (streamingMessageIndex >= 0) streamingMessageIndex = (streamingMessageIndex - removed).coerceAtLeast(-1)
+        adapter.notifyItemRangeRemoved(0, removed)
+        DiagnosticsLogger.log(
+            "INFO",
+            "Memory",
+            "trimmed visible chat transcript removed=$removed remaining=${messages.size}",
+        )
+    }
+
     private fun reloadRecycleView() {
         adapter.notifyDataSetChanged()
-        binding.rvChat.scrollToPosition(messages.size - 1)
+        if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
     }
 
     private fun showLoadingIndicator() {
@@ -1618,18 +1704,29 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun removeLoadingIndicator() {
-        runOnUiThread {
-            val idx = loadingMessageIndex
-            if (idx < 0 || idx >= messages.size) {
-                loadingMessageIndex = -1
-                return@runOnUiThread
-            }
-            if (messages[idx].type == MessageType.LOADING) {
-                messages.removeAt(idx)
-                adapter.notifyItemRemoved(idx)
-            }
+        runOnUiThread { removeLoadingIndicatorOnMainThread() }
+    }
+
+    private fun removeLoadingIndicatorOnMainThread() {
+        val idx = loadingMessageIndex
+        if (idx < 0 || idx >= messages.size) {
             loadingMessageIndex = -1
+            return
         }
+        if (messages[idx].type == MessageType.LOADING) {
+            messages.removeAt(idx)
+            adapter.notifyItemRemoved(idx)
+            if (streamingMessageIndex > idx) streamingMessageIndex -= 1
+        }
+        loadingMessageIndex = -1
+    }
+
+    override fun onDestroy() {
+        popupWindow?.dismiss()
+        downloadJob?.cancel()
+        modelLoadJob?.cancel()
+        modelScope.cancel()
+        super.onDestroy()
     }
 
     companion object {
@@ -1645,6 +1742,7 @@ class MainActivity : FragmentActivity() {
         private const val GPU_MIN_EXTRA_HEADROOM_BYTES = GIB_BYTES
         private const val MODEL_UNLOAD_SETTLE_MS = 1500L
         private const val FALLBACK_VLM_IMAGE_SIZE = 448
+        private const val STREAM_UI_UPDATE_MS = 80L
 
         /** Room for an image, its answer, and a follow-up turn, over the image cost. */
         private const val VLM_CTX_HEADROOM = 2048

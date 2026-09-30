@@ -1,6 +1,7 @@
 package com.geniex.demo.server
 
 import com.geniex.demo.GenerationConfigSample
+import com.geniex.demo.PerformanceTuning
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.sdk.LlmWrapper
 import com.geniex.sdk.VlmWrapper
@@ -11,6 +12,7 @@ import com.geniex.sdk.bean.VlmContent
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.ArrayDeque
 
 object InferenceBridge {
     val mutex = Mutex()
@@ -113,9 +115,10 @@ object InferenceBridge {
     ): Result<Unit> {
         val llmRef = llm
         val vlmRef = vlm
+        val boundedMessages = boundMessages(messages)
         return when {
-            llmRef != null -> streamLlmChat(llmRef, messages, enableThinking, maxTokens, onToken)
-            vlmRef != null -> streamVlmChat(vlmRef, messages, enableThinking, maxTokens, onToken)
+            llmRef != null -> streamLlmChat(llmRef, boundedMessages, enableThinking, maxTokens, onToken)
+            vlmRef != null -> streamVlmChat(vlmRef, boundedMessages, enableThinking, maxTokens, onToken)
             else -> Result.failure(IllegalStateException("No model is loaded"))
         }
     }
@@ -128,9 +131,15 @@ object InferenceBridge {
         val llmRef = llm ?: return Result.failure(
             IllegalStateException("Raw prompt completion is only available for a loaded LLM"),
         )
+        val boundedPrompt = if (prompt.length <= PerformanceTuning.MAX_API_HISTORY_CHARS) {
+            prompt
+        } else {
+            DiagnosticsLogger.log("WARN", "InferenceBridge", "raw prompt truncated from ${prompt.length} chars")
+            prompt.takeLast(PerformanceTuning.MAX_API_HISTORY_CHARS)
+        }
         return collectLlmStream(
             wrapper = llmRef,
-            prompt = prompt,
+            prompt = boundedPrompt,
             maxTokens = maxTokens,
             onToken = onToken,
         )
@@ -214,8 +223,35 @@ object InferenceBridge {
         )
     }
 
-    private fun sanitizeMaxTokens(value: Int): Int = value.coerceIn(1, MAX_MAX_TOKENS)
+    private fun boundMessages(messages: List<Pair<String, String>>): List<Pair<String, String>> {
+        if (messages.size <= PerformanceTuning.MAX_API_MESSAGES &&
+            messages.sumOf { it.second.length } <= PerformanceTuning.MAX_API_HISTORY_CHARS
+        ) return messages
+
+        val system = messages.firstOrNull { it.first == "system" }
+        val tail = ArrayDeque<Pair<String, String>>()
+        var chars = system?.second?.length ?: 0
+        for (message in messages.asReversed()) {
+            if (message === system) continue
+            if (tail.size >= PerformanceTuning.MAX_API_MESSAGES - if (system != null) 1 else 0) break
+            if (chars + message.second.length > PerformanceTuning.MAX_API_HISTORY_CHARS && tail.isNotEmpty()) break
+            tail.addFirst(message)
+            chars += message.second.length
+        }
+        val bounded = buildList {
+            system?.let { add(it) }
+            addAll(tail)
+        }
+        DiagnosticsLogger.log(
+            "INFO",
+            "InferenceBridge",
+            "bounded API history messages=${messages.size}->${bounded.size} chars=${messages.sumOf { it.second.length }}->$chars",
+        )
+        return bounded
+    }
+
+    private fun sanitizeMaxTokens(value: Int): Int =
+        value.coerceIn(1, PerformanceTuning.MAX_API_RESPONSE_TOKENS)
 
     private const val DEFAULT_MAX_TOKENS = 2048
-    private const val MAX_MAX_TOKENS = 32768
 }

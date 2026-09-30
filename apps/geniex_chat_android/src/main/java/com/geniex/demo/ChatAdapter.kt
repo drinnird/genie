@@ -4,9 +4,8 @@
 // ---------------------------------------------------------------------
 package com.geniex.demo
 
-import android.content.Intent
+import android.content.Context
 import android.graphics.BitmapFactory
-import android.net.Uri
 import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
 import android.view.View
@@ -49,6 +48,25 @@ enum class MessageType(
 class ChatAdapter(
     private val messages: List<Message>,
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+    // Markwon (especially tables/LaTeX) is relatively expensive to construct.
+    // Keep one renderer per adapter instead of one per recycled ViewHolder.
+    private var markdownRenderer: Markwon? = null
+
+    private fun markwon(context: Context): Markwon =
+        markdownRenderer ?:
+            Markwon
+                .builder(context)
+                .usePlugin(StrikethroughPlugin.create())
+                .usePlugin(TablePlugin.create(context))
+                .usePlugin(LinkifyPlugin.create())
+                .usePlugin(MarkwonInlineParserPlugin.create())
+                .usePlugin(
+                    JLatexMathPlugin.create(context.resources.displayMetrics.scaledDensity * 16f) { builder ->
+                        builder.inlinesEnabled(true)
+                        builder.blocksEnabled(true)
+                    },
+                ).build()
+                .also { markdownRenderer = it }
     override fun getItemViewType(position: Int): Int {
         val message = messages[position]
         return message.type.value
@@ -66,7 +84,7 @@ class ChatAdapter(
             }
 
             MessageType.ASSISTANT -> {
-                AiViewHolder(inflater.inflate(R.layout.item_ai_message, parent, false))
+                AiViewHolder(inflater.inflate(R.layout.item_ai_message, parent, false), markwon(parent.context))
             }
 
             MessageType.IMAGES -> {
@@ -106,6 +124,18 @@ class ChatAdapter(
         if (holder is ProfileViewHolder) holder.bind(message)
     }
 
+    override fun onBindViewHolder(
+        holder: RecyclerView.ViewHolder,
+        position: Int,
+        payloads: MutableList<Any>,
+    ) {
+        if (payloads.contains(PAYLOAD_STREAM_TEXT) && holder is AiViewHolder) {
+            holder.bindStreaming(messages[position])
+            return
+        }
+        super.onBindViewHolder(holder, position, payloads)
+    }
+
     override fun getItemCount() = messages.size
 
     class UserViewHolder(
@@ -120,25 +150,20 @@ class ChatAdapter(
 
     class AiViewHolder(
         itemView: View,
+        private val markwon: Markwon,
     ) : RecyclerView.ViewHolder(itemView) {
         private val tvMessage: TextView = itemView.findViewById(R.id.tv_message)
-        private val markwon: Markwon =
-            Markwon
-                .builder(itemView.context)
-                .usePlugin(StrikethroughPlugin.create())
-                .usePlugin(TablePlugin.create(itemView.context))
-                .usePlugin(LinkifyPlugin.create())
-                .usePlugin(MarkwonInlineParserPlugin.create())
-                .usePlugin(
-                    JLatexMathPlugin.create(tvMessage.textSize) { builder ->
-                        builder.inlinesEnabled(true)
-                        builder.blocksEnabled(true)
-                    },
-                ).build()
 
         fun bind(message: Message) {
             markwon.setMarkdown(tvMessage, message.content.trim())
             tvMessage.movementMethod = LinkMovementMethod.getInstance()
+        }
+
+        fun bindStreaming(message: Message) {
+            // Markdown parsing on every token creates a large amount of short-lived
+            // objects. Stream plain text and do one full Markdown render at completion.
+            tvMessage.text = message.content
+            tvMessage.movementMethod = null
         }
     }
 
@@ -177,12 +202,29 @@ class ChatAdapter(
                         .from(context)
                         .inflate(R.layout.item_image_item_message, imageContainer, false)
                 val ivImage = itemView.findViewById<ImageView>(R.id.iv_image)
-                val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-                if (bitmap != null) {
-                    ivImage.setImageBitmap(bitmap)
-                }
+                val bitmap = decodeThumbnail(file, 320)
+                if (bitmap != null) ivImage.setImageBitmap(bitmap)
                 imageContainer.addView(itemView)
             }
         }
+
+        private fun decodeThumbnail(file: File, maxDimension: Int): android.graphics.Bitmap? {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            var sample = 1
+            while (maxOf(bounds.outWidth / (sample * 2), bounds.outHeight / (sample * 2)) >= maxDimension) {
+                sample *= 2
+            }
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+            }
+            return BitmapFactory.decodeFile(file.absolutePath, options)
+        }
+    }
+
+    companion object {
+        const val PAYLOAD_STREAM_TEXT = "stream_text"
     }
 }
