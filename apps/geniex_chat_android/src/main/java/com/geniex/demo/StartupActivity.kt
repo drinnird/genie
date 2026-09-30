@@ -11,61 +11,80 @@ import com.geniex.demo.databinding.ActivityStartupBinding
 import com.geniex.demo.storage.WorkingDirectoryManager
 
 /**
- * First-run gate that establishes persistent shared storage before GenieX is
- * initialized. Keeping this separate from MainActivity prevents the native
- * model manager from creating its cache in the wrong location first.
+ * Recovery-safe first-run gate. Workspace activation happens here rather than
+ * Application.onCreate(), so an invalid external path can never brick startup.
  */
 class StartupActivity : FragmentActivity() {
     private lateinit var binding: ActivityStartupBinding
+    private var pendingTreeUri: Uri? = null
+
     private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri == null) {
-            binding.tvStorageStatus.text = "No folder selected. Choose a folder to continue."
+            setStatus("No folder selected. Choose a location to continue.")
             return@registerForActivityResult
         }
-        WorkingDirectoryManager.configure(this, uri)
-            .onSuccess { workspace ->
-                binding.tvStorageStatus.text = "Working folder: ${workspace.root.absolutePath}"
-                launchMain()
-            }
-            .onFailure { error ->
-                binding.tvStorageStatus.text = error.message ?: "Could not use that folder."
-                Toast.makeText(this, binding.tvStorageStatus.text, Toast.LENGTH_LONG).show()
-            }
+        pendingTreeUri = uri
+        configureSelectedFolderOrRequestAccess(uri)
     }
 
     private val allFilesAccessLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        if (WorkingDirectoryManager.hasAllFilesAccess()) {
-            launchFolderPicker()
-        } else {
-            binding.tvStorageStatus.text = "Storage access was not granted. It is required so the native GenieX runtime can open model files from the persistent working folder."
+        if (!WorkingDirectoryManager.hasAllFilesAccess()) {
+            setStatus(
+                "Storage access was not granted. GenieX needs direct filesystem access for the native model runtime. " +
+                    "You can choose the folder again when ready.",
+            )
+            return@registerForActivityResult
         }
+        val uri = pendingTreeUri
+        if (uri != null) configureSelectedFolder(uri) else launchFolderPicker()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        binding = ActivityStartupBinding.inflate(layoutInflater)
+        setContentView(binding.root)
 
-        if (WorkingDirectoryManager.applyConfigured(this)) {
+        binding.btnChooseWorkingDirectory.setOnClickListener { launchFolderPicker() }
+
+        val interruptedStartup = WorkingDirectoryManager.wasMainLaunchPending(this)
+        if (!interruptedStartup && WorkingDirectoryManager.applyConfigured(this)) {
             launchMain()
             return
         }
 
-        binding = ActivityStartupBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-        binding.btnChooseWorkingDirectory.setOnClickListener { beginSelection() }
-        binding.tvStorageStatus.text = when {
-            WorkingDirectoryManager.configuredPath(this) != null && !WorkingDirectoryManager.hasAllFilesAccess() ->
-                "Storage access needs to be granted again before GenieX can use your existing working folder."
-            WorkingDirectoryManager.configuredPath(this) != null ->
-                "The previous working folder is unavailable. Select it again or choose a new folder."
-            else -> "No working folder selected yet."
-        }
+        setStatus(
+            when {
+                interruptedStartup ->
+                    "The previous startup did not finish. The app stayed here to avoid a crash loop. " +
+                        "Choose the workspace again, or select a different location."
+                WorkingDirectoryManager.configuredPath(this) != null && !WorkingDirectoryManager.hasAllFilesAccess() ->
+                    "Your Genie workspace is remembered, but Android storage access is currently disabled. " +
+                        "Choose the workspace to reconnect it."
+                WorkingDirectoryManager.lastWorkspaceError(this) != null ->
+                    "The saved workspace could not be opened: ${WorkingDirectoryManager.lastWorkspaceError(this)}\n\n" +
+                        "Choose the workspace again or select a different location."
+                WorkingDirectoryManager.configuredPath(this) != null ->
+                    "The previous Genie workspace is unavailable. Choose it again or select a new location."
+                else ->
+                    "Choose where the app should create its Genie working folder."
+            },
+        )
     }
 
-    private fun beginSelection() {
+    private fun launchFolderPicker() {
+        setStatus("Choose a parent location. GenieX Chat will create a Genie folder inside it automatically.")
+        folderPicker.launch(WorkingDirectoryManager.configuredUri(this))
+    }
+
+    private fun configureSelectedFolderOrRequestAccess(uri: Uri) {
         if (WorkingDirectoryManager.hasAllFilesAccess()) {
-            launchFolderPicker()
+            configureSelectedFolder(uri)
             return
         }
+
+        setStatus(
+            "Folder selected. Android now needs to allow direct file access so the native GenieX runtime can open model files.",
+        )
         val appSpecificIntent = Intent(
             Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
             Uri.parse("package:$packageName"),
@@ -76,13 +95,27 @@ class StartupActivity : FragmentActivity() {
             }
     }
 
-    private fun launchFolderPicker() {
-        binding.tvStorageStatus.text = "Choose or create a dedicated folder such as Documents/GenieX."
-        folderPicker.launch(WorkingDirectoryManager.configuredUri(this))
+    private fun configureSelectedFolder(uri: Uri) {
+        WorkingDirectoryManager.configure(this, uri)
+            .onSuccess { workspace ->
+                setStatus("Workspace ready: ${workspace.root.absolutePath}")
+                launchMain()
+            }
+            .onFailure { error ->
+                val message = error.message ?: "Could not use that folder."
+                WorkingDirectoryManager.recordWorkspaceError(this, message)
+                setStatus(message)
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            }
     }
 
     private fun launchMain() {
+        WorkingDirectoryManager.markMainLaunchPending(this)
         startActivity(Intent(this, MainActivity::class.java))
         finish()
+    }
+
+    private fun setStatus(message: String) {
+        if (::binding.isInitialized) binding.tvStorageStatus.text = message
     }
 }

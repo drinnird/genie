@@ -214,3 +214,18 @@ performance settings. GitHub Actions remains the authoritative Android `lintDebu
 - Requests the permission when the user starts the server.
 - Keeps the foreground service functional if the user denies notification permission.
 - Guards subsequent `NotificationManager.notify()` updates with a runtime permission check, resolving the Android Lint `NotificationPermission` build failure without suppressing the rule.
+
+## v13 workspace/startup safety
+
+- Selecting a parent location now creates/uses a dedicated `Genie/` child.
+- `Genie/models`, `Genie/aihub`, `Genie/logs`, `Genie/diagnostics`,
+  `Genie/attachments`, and `Genie/temp` are created and write-tested before the
+  selection is saved.
+- Workspace activation was removed from `Application.onCreate()` so a stale or
+  inaccessible external-storage path cannot crash-loop the app before recovery
+  UI appears.
+- Main launch is guarded. The pending flag is cleared only after the GenieX SDK
+  reports successful initialization; if startup dies before then, the next app
+  launch stays on workspace setup instead of immediately repeating the crash.
+- GenieX SDK initialization failure now returns to workspace setup with the
+  error preserved instead of leaving an unusable saved workspace.

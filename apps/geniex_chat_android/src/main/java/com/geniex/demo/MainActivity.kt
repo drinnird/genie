@@ -398,6 +398,7 @@ class MainActivity : FragmentActivity() {
             object : GenieXSdk.InitCallback {
                 override fun onSuccess() {
                     sdkReady = true
+                    WorkingDirectoryManager.markMainLaunchHealthy(this@MainActivity)
                     DiagnosticsLogger.log("INFO", TAG, "GenieX SDK initialized")
                     runOnUiThread {
                         // Re-query the configured persistent cache now that the
@@ -411,6 +412,16 @@ class MainActivity : FragmentActivity() {
                 override fun onFailure(reason: String) {
                     Log.e(TAG, "GenieXSdk init failed: $reason")
                     DiagnosticsLogger.log("ERROR", TAG, "GenieX SDK init failed: $reason")
+                    WorkingDirectoryManager.recordWorkspaceError(this@MainActivity, "GenieX initialization failed: $reason")
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "GenieX could not initialize this workspace. Returning to workspace setup.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        startActivity(Intent(this@MainActivity, StartupActivity::class.java))
+                        finish()
+                    }
                 }
             },
         )

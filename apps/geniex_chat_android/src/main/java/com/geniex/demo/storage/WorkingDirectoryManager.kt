@@ -12,20 +12,21 @@ import java.io.File
 /**
  * Owns the persistent, user-selected GenieX workspace.
  *
- * GenieX's native model manager needs a real POSIX filesystem path rather than
- * a content:// URI. The app therefore combines Android's folder picker with
- * All files access, resolves ExternalStorageProvider tree URIs to their backing
- * filesystem directory, and sets GENIEX_DATADIR before the SDK is initialized.
+ * The user chooses a parent location. GenieX Chat creates/uses a dedicated
+ * <parent>/Genie directory so app files never spill directly into Documents,
+ * Downloads, or another broad folder.
  *
- * Files in this shared-storage folder survive app uninstall. Android removes
- * the app's stored preference/permission on uninstall, so after reinstall the
- * user must select the same folder again; the existing GenieX cache is then
- * discovered automatically.
+ * GenieX's native model manager needs ordinary filesystem paths. For the
+ * direct-path persistent cache used by this build, Android's All files access
+ * is required. Folder selection itself is still handled by the system picker.
  */
 object WorkingDirectoryManager {
     private const val PREFS = "geniex_workspace"
     private const val KEY_URI = "tree_uri"
     private const val KEY_PATH = "filesystem_path"
+    private const val KEY_MAIN_LAUNCH_PENDING = "main_launch_pending"
+    private const val KEY_LAST_WORKSPACE_ERROR = "last_workspace_error"
+    private const val WORKSPACE_NAME = "Genie"
 
     data class Workspace(
         val root: File,
@@ -52,63 +53,123 @@ object WorkingDirectoryManager {
         return workspaceFor(File(path))
     }
 
+    fun wasMainLaunchPending(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_MAIN_LAUNCH_PENDING, false)
+
+    fun markMainLaunchPending(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_MAIN_LAUNCH_PENDING, true)
+            .apply()
+    }
+
+    /** Called only after the GenieX SDK reports successful initialization. */
+    fun markMainLaunchHealthy(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_MAIN_LAUNCH_PENDING, false)
+            .remove(KEY_LAST_WORKSPACE_ERROR)
+            .apply()
+    }
+
+    fun recordWorkspaceError(context: Context, message: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_MAIN_LAUNCH_PENDING, false)
+            .putString(KEY_LAST_WORKSPACE_ERROR, message.take(1000))
+            .apply()
+    }
+
+    fun lastWorkspaceError(context: Context): String? =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_LAST_WORKSPACE_ERROR, null)
+
     /**
      * Apply the previously selected workspace to the current process.
      * Must run before GenieXSdk.init / ModelManagerWrapper are first touched.
+     *
+     * This method deliberately catches every workspace/setup failure. A stale
+     * external-storage path must never be able to crash-loop the application.
      */
     fun applyConfigured(context: Context): Boolean {
         if (!hasAllFilesAccess()) return false
         val path = configuredPath(context) ?: return false
-        val root = File(path)
         return runCatching {
+            val root = File(path)
+            require(root.name.equals(WORKSPACE_NAME, ignoreCase = true)) {
+                "The saved workspace is not a Genie workspace. Select a folder again."
+            }
             prepareAndApply(context, root)
             true
-        }.getOrElse { false }
+        }.getOrElse { error ->
+            recordWorkspaceError(context, error.message ?: error.javaClass.simpleName)
+            false
+        }
     }
 
+    /**
+     * Configure from the parent directory selected by the user. A dedicated
+     * Genie/ child is created automatically. If the selected directory is
+     * already named Genie, it is used directly to avoid Genie/Genie nesting.
+     */
     fun configure(context: Context, treeUri: Uri): Result<Workspace> = runCatching {
         if (!hasAllFilesAccess()) {
-            error("All files access is required for a persistent GenieX model directory.")
+            error("Storage access is not enabled yet. Grant access, then select the folder again.")
         }
 
         val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
             android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         runCatching { context.contentResolver.takePersistableUriPermission(treeUri, flags) }
 
-        val root = resolveExternalStorageTree(context, treeUri)
-            ?: error("Choose a folder from internal shared storage or a mounted SD card. Cloud/document providers cannot be used for native model files.")
+        val selected = resolveExternalStorageTree(context, treeUri)
+            ?: error(
+                "Choose a folder from internal shared storage or a mounted SD card. " +
+                    "Cloud/document providers cannot be used for native model files.",
+            )
 
-        if (!root.exists() && !root.mkdirs()) {
-            error("Could not create ${root.absolutePath}")
+        if (!selected.exists() && !selected.mkdirs()) {
+            error("Could not create ${selected.absolutePath}")
         }
-        if (!root.isDirectory || !root.canRead() || !root.canWrite()) {
-            error("The selected folder is not readable and writable.")
+        if (!selected.isDirectory) error("The selected location is not a folder.")
+
+        val root = if (selected.name.equals(WORKSPACE_NAME, ignoreCase = true)) {
+            selected
+        } else {
+            File(selected, WORKSPACE_NAME)
         }
+
+        // Prepare everything before committing preferences. A failed setup can
+        // therefore never leave a bad path that is blindly reused next launch.
+        val workspace = prepareAndApply(context, root)
 
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (!prefs.edit()
                 .putString(KEY_URI, treeUri.toString())
                 .putString(KEY_PATH, root.canonicalPath)
+                .putBoolean(KEY_MAIN_LAUNCH_PENDING, false)
+                .remove(KEY_LAST_WORKSPACE_ERROR)
                 .commit()
         ) {
             error("Could not save the working directory selection.")
         }
 
-        prepareAndApply(context, root)
+        workspace
     }
 
-    /**
-     * Clear only the remembered selection. Files in shared storage are never
-     * deleted here.
-     */
+    /** Clear only the remembered selection. Persistent workspace files remain. */
     fun forgetSelection(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().commit()
     }
 
     private fun prepareAndApply(context: Context, root: File): Workspace {
+        if (!root.exists() && !root.mkdirs()) error("Could not create ${root.absolutePath}")
+        if (!root.isDirectory || !root.canRead() || !root.canWrite()) {
+            error("The Genie workspace is not readable and writable: ${root.absolutePath}")
+        }
+
         val workspace = workspaceFor(root)
         listOf(
-            workspace.root,
             workspace.models,
             workspace.aiHubCache,
             workspace.logs,
@@ -117,14 +178,18 @@ object WorkingDirectoryManager {
             workspace.temp,
         ).forEach { dir ->
             if (!dir.exists() && !dir.mkdirs()) error("Could not create ${dir.absolutePath}")
+            if (!dir.isDirectory || !dir.canRead() || !dir.canWrite()) {
+                error("Workspace folder is not readable and writable: ${dir.absolutePath}")
+            }
         }
 
-        // ModelManager's StoreConfig reads this environment variable on first
-        // use and stores models below <root>/models.
-        Os.setenv("GENIEX_DATADIR", workspace.root.canonicalPath, true)
+        // Verify real I/O rather than relying only on File.canWrite(), which
+        // can be misleading around scoped/external storage boundaries.
+        val probe = File(workspace.temp, ".workspace-write-test-${android.os.Process.myPid()}")
+        probe.writeText("ok")
+        if (!probe.delete()) probe.deleteOnExit()
 
-        // Diagnostics are deliberately outside app-private storage so they
-        // remain available after uninstall as well.
+        Os.setenv("GENIEX_DATADIR", workspace.root.canonicalPath, true)
         DiagnosticsLogger.useWorkingDirectory(context, workspace.root)
 
         File(workspace.root, "README.txt").let { marker ->
@@ -138,7 +203,7 @@ object WorkingDirectoryManager {
                             "diagnostics/ exported diagnostic ZIP files\n" +
                             "attachments/ persistent chat image copies\n" +
                             "temp/        temporary app files\n\n" +
-                            "You may keep this folder across app reinstalls. After reinstalling, select this same folder again.\n",
+                            "Keep this Genie folder across app reinstalls. After reinstalling, select its parent (or the Genie folder itself) again.\n",
                     )
                 }
             }
@@ -164,7 +229,7 @@ object WorkingDirectoryManager {
         val volumeId = parts.firstOrNull()?.takeIf { it.isNotBlank() } ?: return null
         val relativePath = parts.getOrNull(1).orEmpty()
 
-        val root = if (volumeId.equals("primary", ignoreCase = true)) {
+        val storageRoot = if (volumeId.equals("primary", ignoreCase = true)) {
             Environment.getExternalStorageDirectory()
         } else {
             val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
@@ -173,6 +238,6 @@ object WorkingDirectoryManager {
                 ?.directory
         } ?: return null
 
-        return if (relativePath.isBlank()) root else File(root, relativePath)
+        return if (relativePath.isBlank()) storageRoot else File(storageRoot, relativePath)
     }
 }

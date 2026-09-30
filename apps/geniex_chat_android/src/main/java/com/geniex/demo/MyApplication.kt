@@ -8,7 +8,6 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import android.util.Log
 import com.geniex.demo.diagnostics.DiagnosticsLogger
-import com.geniex.demo.storage.WorkingDirectoryManager
 import com.geniex.demo.server.LocalApiServer
 import java.io.File
 
@@ -17,9 +16,6 @@ class MyApplication : Application() {
         super.onCreate()
         if (Application.getProcessName().endsWith(":restarter")) return
         DiagnosticsLogger.init(this)
-        // Apply a previously selected shared workspace as early as possible so
-        // services and restored activities inherit the same GenieX model cache.
-        WorkingDirectoryManager.applyConfigured(this)
         clearLegacyModelsDir()
     }
 

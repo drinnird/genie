@@ -28,7 +28,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
-            android:text="Models, logs, diagnostics, and persistent attachments will live in one folder you control."
+            android:text="Choose a location and GenieX Chat will create a dedicated Genie folder containing models, logs, diagnostics, and attachments."
             android:textColor="@color/text_secondary"
             android:textSize="15sp" />
 
@@ -60,7 +60,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
-                    android:text="Files in the workspace remain on the device if the app is uninstalled. After reinstalling, select the same folder and GenieX will rediscover its downloaded models."
+                    android:text="The app creates Genie/ inside the location you select. That folder can remain on the device after uninstall; after reinstalling, select the same parent location (or Genie itself) to reconnect it."
                     android:textColor="@color/text_secondary"
                     android:textSize="14sp" />
 
@@ -68,7 +68,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="16dp"
-                    android:text="The folder will contain"
+                    android:text="Genie/ will contain"
                     android:textColor="@color/font_black"
                     android:textSize="14sp"
                     android:textStyle="bold" />
@@ -86,7 +86,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="16dp"
-                    android:text="Android will ask for All files access because GenieX's native model runtime requires normal filesystem paths for multi-gigabyte model files. The app uses that access for the workspace you select."
+                    android:text="The native GenieX runtime opens multi-gigabyte model files using normal filesystem paths. Android may therefore show its one-time special storage-access screen. The app limits its own model/log operations to the Genie workspace you select."
                     android:textColor="@color/text_secondary"
                     android:textSize="13sp" />
             </LinearLayout>

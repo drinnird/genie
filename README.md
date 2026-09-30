@@ -48,3 +48,16 @@ The customized build uses conservative phone-oriented llama.cpp settings, bounde
 buffers, sampled image decoding, throttled streaming UI updates, a bounded API surface, and lifecycle-aware
 background work. Large model switches still use a fresh native process when needed because GPU/NPU/QAIRT
 allocations may outlive Java/Kotlin objects and cannot be made reliable with forced Java garbage collection.
+
+## Persistent workspace behavior
+
+At first launch, choose a parent folder. GenieX Chat creates a dedicated
+`Genie/` folder beneath it and keeps model/cache/log data in subfolders there.
+If the selected folder itself is already named `Genie`, it is reused directly.
+
+This build still uses Android's **All files access** special permission because
+the current GenieX native model manager consumes ordinary filesystem paths via
+`GENIEX_DATADIR`; Android's Storage Access Framework `content://` handles are
+not directly usable by that native path-based cache. Workspace setup is now
+recovery-safe: a stale or invalid saved path will return to the setup screen
+instead of crash-looping the application.
