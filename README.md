@@ -35,3 +35,9 @@ When the in-app server is enabled, open the URL shown on the **Server** screen t
 ## Model loading stability
 
 Qwen3.5 0.8B / 2B / 4B are loaded through the text-only LLM path by default to reduce RAM use. Use the dedicated Qwen3-VL entries when image input is required. GPU loads also perform a free-memory preflight and may ask you to use NPU or close other apps instead of risking an Android low-memory process kill.
+
+## Persistent working directory
+
+On first launch this customized build asks you to select a shared-storage working folder (for example `Documents/GenieX`). The folder contains model weights, GenieX cache metadata, diagnostic logs/exports, attachments, and temporary files. Because it is shared storage, the files survive app uninstall. After reinstalling, select the same folder again to rediscover downloaded models.
+
+The app requests Android **All files access** for this feature because GenieX's native model runtimes consume ordinary filesystem paths rather than Storage Access Framework `content://` URIs. The application uses the selected workspace as `GENIEX_DATADIR` before initializing the SDK.

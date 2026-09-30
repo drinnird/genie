@@ -8,10 +8,12 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.FragmentActivity
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.geniex.demo.StartupActivity
 import com.geniex.demo.bean.ModelData
 import com.geniex.demo.databinding.ActivityModelsBinding
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.server.InferenceBridge
+import com.geniex.demo.storage.WorkingDirectoryManager
 import com.geniex.sdk.GenieXSdk
 import com.geniex.sdk.ModelManagerWrapper
 import com.geniex.sdk.bean.HubSource
@@ -34,12 +36,21 @@ class ModelManagementActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (!WorkingDirectoryManager.applyConfigured(this)) {
+            startActivity(Intent(this, StartupActivity::class.java))
+            finish()
+            return
+        }
         binding = ActivityModelsBinding.inflate(layoutInflater)
         setContentView(binding.root)
         models = ModelCatalog.load(this)
 
         adapter = ModelManagementAdapter(::downloadModel, ::selectModel, ::confirmDelete)
         binding.rvModels.layoutManager = LinearLayoutManager(this)
+        // RecyclerView's default change animation cross-fades a whole card on
+        // every progress update, which looks like flashing/pulsing during large
+        // downloads. Progress should update in place instead.
+        binding.rvModels.itemAnimator = null
         binding.rvModels.adapter = adapter
         binding.btnModelsBack.setOnClickListener { finish() }
         GenieXSdk.getInstance().init(
@@ -195,7 +206,11 @@ class ModelManagementActivity : FragmentActivity() {
         runOnUiThread {
             adapter.submitList(newStates)
             val available = newStates.count { it.available }
-            binding.tvModelStorageSummary.text = "$available of ${newStates.size} models available on this device"
+            val workspace = WorkingDirectoryManager.workspace(this@ModelManagementActivity)?.root?.absolutePath
+            binding.tvModelStorageSummary.text = buildString {
+                append("$available of ${newStates.size} models available")
+                if (!workspace.isNullOrBlank()) append("\nWorkspace: $workspace")
+            }
         }
     }
 

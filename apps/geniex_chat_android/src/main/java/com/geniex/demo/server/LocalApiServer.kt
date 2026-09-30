@@ -24,6 +24,7 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -33,7 +34,8 @@ object LocalApiServer {
     private const val MAX_BODY_BYTES = 1024 * 1024
     private const val DEFAULT_MAX_TOKENS = 2048
     private val running = AtomicBoolean(false)
-    private val executor = Executors.newFixedThreadPool(4)
+    private val executor = Executors.newFixedThreadPool(6)
+    private val apiInferenceBusy = AtomicBoolean(false)
     private val json = Json { ignoreUnknownKeys = true }
 
     @Volatile private var serverSocket: ServerSocket? = null
@@ -64,6 +66,7 @@ object LocalApiServer {
             this.apiKey = apiKey
             serverSocket = socket
             lastError = null
+            apiInferenceBusy.set(false)
             running.set(true)
             Thread({ acceptLoop(socket) }, "GenieX-ApiAccept").apply {
                 isDaemon = true
@@ -80,6 +83,8 @@ object LocalApiServer {
     @Synchronized
     fun stop() {
         running.set(false)
+        if (apiInferenceBusy.get()) requestInferenceStop()
+        apiInferenceBusy.set(false)
         runCatching { serverSocket?.close() }
         serverSocket = null
         DiagnosticsLogger.log("INFO", "ApiServer", "stopped")
@@ -110,7 +115,8 @@ object LocalApiServer {
 
     private fun handleClient(socket: Socket) {
         socket.use { client ->
-            client.soTimeout = 60_000
+            // Do not let speculative/abandoned browser sockets occupy a worker for a full minute.
+            client.soTimeout = 15_000
             val input = BufferedInputStream(client.getInputStream())
             val output = BufferedOutputStream(client.getOutputStream())
             try {
@@ -151,8 +157,12 @@ object LocalApiServer {
                     method == "POST" && path == "/v1/chat/completions" -> handleChat(output, body)
                     method == "POST" && path == "/v1/completions" -> handleOpenAiCompletion(output, body)
                     method == "POST" && path == "/completion" -> handleLlamaCompletion(output, body)
+                    method == "POST" && (path == "/v1/stop" || path == "/stop") -> handleStop(output)
                     else -> writeJson(output, 404, errorJson(404, "not found", "not_found_error"))
                 }
+            } catch (e: SocketException) {
+                if (apiInferenceBusy.get()) requestInferenceStop()
+                DiagnosticsLogger.log("INFO", "ApiServer", "client disconnected: ${e.message}")
             } catch (e: Exception) {
                 DiagnosticsLogger.log("ERROR", "ApiServer", "request failed", e)
                 runCatching { writeJson(output, 500, errorJson(500, e.message ?: "internal error", "server_error")) }
@@ -169,6 +179,7 @@ object LocalApiServer {
                     put("status", JsonPrimitive("ok"))
                     put("model", JsonPrimitive(InferenceBridge.activeModelId ?: "loaded-model"))
                     put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
+                    put("busy", JsonPrimitive(apiInferenceBusy.get() || InferenceBridge.isBusy()))
                 },
             )
         } else {
@@ -201,17 +212,22 @@ object LocalApiServer {
         val stream = root["stream"]?.jsonPrimitive?.booleanOrNull == true
         val maxTokens = requestedMaxTokens(root)
         val enableThinking = requestedThinking(root)
-        if (stream) {
-            handleChatStream(output, messages, maxTokens, enableThinking)
-        } else {
-            val result = runBlocking { InferenceBridge.generateText(messages, enableThinking, maxTokens) }
-            result.fold(
-                onSuccess = { response -> writeJson(output, 200, chatCompletionJson(response)) },
-                onFailure = {
-                    DiagnosticsLogger.log("ERROR", "ApiServer", "inference failed", it)
-                    writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error"))
-                },
-            )
+        if (!acquireInferenceSlot(output, "/v1/chat/completions")) return
+        try {
+            if (stream) {
+                handleChatStream(output, messages, maxTokens, enableThinking)
+            } else {
+                val result = runBlocking { InferenceBridge.generateText(messages, enableThinking, maxTokens) }
+                result.fold(
+                    onSuccess = { response -> writeJson(output, 200, chatCompletionJson(response)) },
+                    onFailure = {
+                        DiagnosticsLogger.log("ERROR", "ApiServer", "inference failed", it)
+                        writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error"))
+                    },
+                )
+            }
+        } finally {
+            releaseInferenceSlot("/v1/chat/completions")
         }
     }
 
@@ -238,9 +254,15 @@ object LocalApiServer {
                 writeSseDone(output)
             },
             onFailure = {
-                DiagnosticsLogger.log("ERROR", "ApiServer", "streaming inference failed", it)
-                writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
-                writeSseDone(output)
+                if (it is SocketException) {
+                    DiagnosticsLogger.log("INFO", "ApiServer", "stream client disconnected: ${it.message}")
+                } else {
+                    DiagnosticsLogger.log("ERROR", "ApiServer", "streaming inference failed", it)
+                }
+                runCatching {
+                    writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                    writeSseDone(output)
+                }
             },
         )
     }
@@ -262,6 +284,8 @@ object LocalApiServer {
         val model = InferenceBridge.activeModelId ?: "loaded-model"
         val created = System.currentTimeMillis() / 1000L
 
+        if (!acquireInferenceSlot(output, "/v1/completions")) return
+        try {
         if (stream) {
             writeSseHeaders(output)
             val result = runBlocking {
@@ -275,8 +299,10 @@ object LocalApiServer {
                     writeSseDone(output)
                 },
                 onFailure = {
-                    writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
-                    writeSseDone(output)
+                    runCatching {
+                        writeSseData(output, errorJson(500, it.message ?: "inference failed", "server_error"))
+                        writeSseDone(output)
+                    }
                 },
             )
         } else {
@@ -309,6 +335,9 @@ object LocalApiServer {
                 onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
             )
         }
+        } finally {
+            releaseInferenceSlot("/v1/completions")
+        }
     }
 
     private fun handleLlamaCompletion(output: BufferedOutputStream, body: ByteArray) {
@@ -323,6 +352,8 @@ object LocalApiServer {
         val prompt = root["prompt"]?.jsonPrimitive?.contentOrNull
             ?: return writeJson(output, 400, errorJson(400, "prompt must be a string", "invalid_request_error"))
         val maxTokens = root["n_predict"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 } ?: requestedMaxTokens(root)
+        if (!acquireInferenceSlot(output, "/completion")) return
+        try {
         val result = runBlocking { InferenceBridge.generatePrompt(prompt, maxTokens) }
         result.fold(
             onSuccess = { text ->
@@ -338,6 +369,53 @@ object LocalApiServer {
             },
             onFailure = { writeJson(output, 500, errorJson(500, it.message ?: "inference failed", "server_error")) },
         )
+        } finally {
+            releaseInferenceSlot("/completion")
+        }
+    }
+
+    private fun handleStop(output: BufferedOutputStream) {
+        val wasBusy = apiInferenceBusy.get() || InferenceBridge.isBusy()
+        if (wasBusy) requestInferenceStop()
+        writeJson(
+            output,
+            200,
+            buildJsonObject {
+                put("stopping", JsonPrimitive(wasBusy))
+                put("status", JsonPrimitive(if (wasBusy) "stop_requested" else "idle"))
+            },
+        )
+    }
+
+    private fun acquireInferenceSlot(output: BufferedOutputStream, endpoint: String): Boolean {
+        if (!apiInferenceBusy.compareAndSet(false, true)) {
+            DiagnosticsLogger.log("INFO", "ApiServer", "busy request rejected endpoint=$endpoint")
+            writeJson(output, 429, errorJson(429, "Model is busy with another generation", "busy_error"))
+            return false
+        }
+        if (InferenceBridge.isBusy()) {
+            apiInferenceBusy.set(false)
+            DiagnosticsLogger.log("INFO", "ApiServer", "native UI is using model; request rejected endpoint=$endpoint")
+            writeJson(output, 429, errorJson(429, "Model is busy with another generation", "busy_error"))
+            return false
+        }
+        DiagnosticsLogger.log("INFO", "ApiServer", "inference slot acquired endpoint=$endpoint")
+        return true
+    }
+
+    private fun releaseInferenceSlot(endpoint: String) {
+        apiInferenceBusy.set(false)
+        DiagnosticsLogger.log("INFO", "ApiServer", "inference slot released endpoint=$endpoint")
+    }
+
+    private fun requestInferenceStop() {
+        Thread(
+            {
+                runCatching { runBlocking { InferenceBridge.stopActiveStream() } }
+                    .onFailure { DiagnosticsLogger.log("ERROR", "ApiServer", "stop request failed", it) }
+            },
+            "GenieX-ApiStop",
+        ).apply { isDaemon = true }.start()
     }
 
     private fun parseJsonObject(body: ByteArray): JsonObject? = runCatching {
@@ -479,6 +557,7 @@ object LocalApiServer {
                             put("owned_by", JsonPrimitive("geniex-local"))
                             put("name", JsonPrimitive(InferenceBridge.activeModelName ?: id))
                             put("compute", JsonPrimitive(InferenceBridge.requestedComputeUnit ?: "unknown"))
+                            put("busy", JsonPrimitive(apiInferenceBusy.get() || InferenceBridge.isBusy()))
                         },
                     )
                 } ?: emptyList(),
@@ -583,6 +662,7 @@ object LocalApiServer {
         401 -> "Unauthorized"
         404 -> "Not Found"
         413 -> "Payload Too Large"
+        429 -> "Too Many Requests"
         503 -> "Service Unavailable"
         else -> "Internal Server Error"
     }

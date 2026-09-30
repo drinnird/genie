@@ -24,6 +24,12 @@ class ModelManagementAdapter(
     private val onDelete: (ModelData) -> Unit,
 ) : ListAdapter<ModelUiState, ModelManagementAdapter.ViewHolder>(DiffCallback) {
 
+    init {
+        setHasStableIds(true)
+    }
+
+    override fun getItemId(position: Int): Long = getItem(position).model.id.hashCode().toLong()
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val binding = ItemModelManagementBinding.inflate(LayoutInflater.from(parent.context), parent, false)
         return ViewHolder(binding)
@@ -35,7 +41,12 @@ class ModelManagementAdapter(
         fun bind(state: ModelUiState) {
             val model = state.model
             binding.tvModelName.text = model.displayName
-            binding.tvModelMeta.text = listOfNotNull(model.quant, model.computeSummary).joinToString("  •  ")
+            binding.tvModelMeta.text =
+                listOfNotNull(
+                    model.quant,
+                    model.computeSummary,
+                    model.minAvailableMemoryGiB?.let { String.format("%.1f GiB free recommended", it) },
+                ).joinToString("  •  ")
             binding.tvModelRepo.text = model.modelName
             binding.pbModelDownload.visibility = if (state.downloading) android.view.View.VISIBLE else android.view.View.GONE
             binding.pbModelDownload.progress = state.progress ?: 0
@@ -61,6 +72,11 @@ class ModelManagementAdapter(
             }
             binding.btnModelUse.setOnClickListener { onUse(model) }
 
+            // Do not show destructive controls for models that do not exist
+            // locally. Once downloaded the action appears; active models keep
+            // it visible but disabled until unloaded.
+            binding.btnModelDelete.visibility =
+                if (state.available && !state.downloading) android.view.View.VISIBLE else android.view.View.GONE
             binding.btnModelDelete.isEnabled = state.available && !state.loaded && !state.downloading
             binding.btnModelDelete.setOnClickListener { onDelete(model) }
         }

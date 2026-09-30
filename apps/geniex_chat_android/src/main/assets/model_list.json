@@ -18,6 +18,15 @@
     "runtime": "llama_cpp"
   },
   {
+    "id": "Qwen3-4B-GGUF",
+    "displayName": "Qwen3 4B GGUF",
+    "modelName": "unsloth/Qwen3-4B-GGUF",
+    "quant": "Q4_0",
+    "hub": "HUGGINGFACE",
+    "type": "chat",
+    "runtime": "llama_cpp"
+  },
+  {
     "id": "Qwen3.5-0.8B-GGUF",
     "displayName": "Qwen3.5 0.8B",
     "modelName": "unsloth/Qwen3.5-0.8B-GGUF",
@@ -82,20 +91,22 @@
   },
   {
     "id": "Qwen3-4B",
-    "displayName": "Qwen3 4B (AI Hub)",
+    "displayName": "Qwen3 4B (AI Hub \u2022 high memory)",
     "modelName": "ai-hub-models/Qwen3-4B",
     "hub": "AUTO",
     "chipset": "SM8750",
     "type": "chat",
-    "runtime": "qairt"
+    "runtime": "qairt",
+    "minAvailableMemoryGiB": 8.0
   },
   {
     "id": "Qwen3-4B-Instruct-2507",
-    "displayName": "Qwen3 4B Instruct 2507 (AI Hub)",
+    "displayName": "Qwen3 4B Instruct 2507 (AI Hub \u2022 high memory)",
     "modelName": "ai-hub-models/Qwen3-4B-Instruct-2507",
     "hub": "AUTO",
     "chipset": "SM8750",
     "type": "chat",
-    "runtime": "qairt"
+    "runtime": "qairt",
+    "minAvailableMemoryGiB": 8.0
   }
 ]

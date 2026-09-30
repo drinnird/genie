@@ -61,6 +61,14 @@ object InferenceBridge {
 
     fun isLoaded(): Boolean = llm != null || vlm != null
 
+    /** Ask the currently loaded native wrapper to stop generation. */
+    suspend fun stopActiveStream(): Result<Unit> = runCatching {
+        llm?.stopStream()
+        vlm?.stopStream()
+    }
+
+    fun isBusy(): Boolean = mutex.isLocked
+
     suspend fun generateText(
         messages: List<Pair<String, String>>,
         enableThinking: Boolean = false,

@@ -62,21 +62,22 @@ class ServerActivity : FragmentActivity() {
         AppPreferences.setServerPort(this, port)
         AppPreferences.setLanEnabled(this, lan)
         AppPreferences.setApiKey(this, key)
-        LocalApiServer.start(applicationContext, port, lan, key).fold(
-            onSuccess = { Toast.makeText(this, "Web chat and API server started.", Toast.LENGTH_SHORT).show() },
-            onFailure = { Toast.makeText(this, "Server failed: ${it.message}", Toast.LENGTH_LONG).show() },
-        )
-        refreshUi()
+        LocalApiService.start(applicationContext, port, lan, key)
+        Toast.makeText(this, "Starting web chat and API server...", Toast.LENGTH_SHORT).show()
+        binding.root.postDelayed({ refreshUi() }, 300L)
+        binding.root.postDelayed({ refreshUi() }, 1200L)
     }
 
     private fun stopServer() {
-        LocalApiServer.stop()
-        refreshUi()
+        LocalApiService.stop(applicationContext)
+        binding.root.postDelayed({ refreshUi() }, 250L)
     }
 
     private fun refreshUi() {
         val running = LocalApiServer.isRunning()
-        binding.tvServerStatus.text = if (running) "Running" else "Stopped"
+        binding.tvServerStatus.text = if (running) {
+            if (LocalApiService.active) "Running in background" else "Running"
+        } else "Stopped"
         binding.btnServerToggle.text = if (running) "Stop server" else "Start server"
         binding.tvLocalAddress.text = if (running) LocalApiServer.localhostUrl() else "—"
         binding.tvLanAddress.text = if (running) LocalApiServer.lanUrl() ?: "LAN access disabled" else "—"

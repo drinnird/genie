@@ -48,16 +48,25 @@ class DiagnosticsActivity : FragmentActivity() {
     private fun refresh() {
         binding.tvDiagnosticsSummary.text = buildString {
             appendLine("Last operation: ${DiagnosticsLogger.lastOperation().ifBlank { "None" }}")
+            appendLine("Log folder: ${DiagnosticsLogger.logDirectoryPath().ifBlank { "App storage" }}")
             appendLine("Interrupted model load: ${if (DiagnosticsLogger.wasModelLoadInterrupted()) "Yes" else "No"}")
+            appendLine("Last model-load stage: ${DiagnosticsLogger.lastModelLoadStage().ifBlank { "None" }}")
             if (DiagnosticsLogger.wasModelLoadInterrupted()) {
                 appendLine("Model load details: ${DiagnosticsLogger.interruptedModelDetails()}")
             }
+            appendLine("Detailed files: model-loader.log, memory.csv, native-runtime.log, api-server.log")
         }
         binding.tvDiagnosticsLog.text = DiagnosticsLogger.readRecentLog()
     }
 
     private fun shareExport() {
-        val file = DiagnosticsLogger.exportZip(this)
+        val persistentFile = DiagnosticsLogger.exportZip(this)
+        // FileProvider is intentionally limited to app-controlled cache/files
+        // roots. Keep the persistent export in the workspace, and copy only
+        // the share payload into cache for a temporary content:// grant.
+        val shareDir = File(cacheDir, "diagnostics").apply { mkdirs() }
+        val file = File(shareDir, persistentFile.name)
+        persistentFile.copyTo(file, overwrite = true)
         val uri: Uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "application/zip"

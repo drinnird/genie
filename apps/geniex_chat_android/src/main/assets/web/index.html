@@ -99,11 +99,12 @@
     }
     .composer-actions { display: flex; align-items: center; gap: 8px; }
     .hint { flex: 1; color: var(--muted); font-size: 11px; padding-left: 8px; }
-    .send {
-      border: 0; border-radius: 12px; background: var(--accent); color: var(--accentText);
-      padding: 8px 18px; cursor: pointer; font-weight: 650;
+    .send, .stop {
+      border: 0; border-radius: 12px; padding: 8px 18px; cursor: pointer; font-weight: 650;
     }
-    .send:disabled { opacity: .45; cursor: not-allowed; }
+    .send { background: var(--accent); color: var(--accentText); }
+    .stop { background: color-mix(in srgb, var(--danger) 12%, var(--panel)); color: var(--danger); }
+    .send:disabled, .stop:disabled { opacity: .45; cursor: not-allowed; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
     @media (max-width: 600px) {
       .messages { padding-left: 10px; padding-right: 10px; }
@@ -148,6 +149,7 @@
       <textarea id="prompt" rows="1" placeholder="Message the loaded model…" aria-label="Message"></textarea>
       <div class="composer-actions">
         <div class="hint">Enter to send • Shift+Enter for a new line</div>
+        <button class="stop" id="stop" type="button" disabled>Stop</button>
         <button class="send" id="send" type="button" disabled>Send</button>
       </div>
     </div>
@@ -160,6 +162,7 @@
     empty: document.getElementById('emptyState'),
     prompt: document.getElementById('prompt'),
     send: document.getElementById('send'),
+    stop: document.getElementById('stop'),
     key: document.getElementById('apiKey'),
     saveKey: document.getElementById('saveKey'),
     clear: document.getElementById('clearChat'),
@@ -171,6 +174,7 @@
   let messages = [];
   let busy = false;
   let modelLoaded = false;
+  let activeController = null;
   let apiKey = sessionStorage.getItem('geniex_api_key') || '';
   els.key.value = apiKey;
 
@@ -189,6 +193,7 @@
 
   function updateSendState() {
     els.send.disabled = busy || !modelLoaded || !els.prompt.value.trim();
+    els.stop.disabled = !busy;
   }
 
   function growTextarea() {
@@ -225,6 +230,7 @@
   }
 
   async function refreshStatus() {
+    if (busy) return;
     try {
       const health = await fetch('/health', { cache: 'no-store' });
       modelLoaded = health.ok;
@@ -234,6 +240,8 @@
         updateSendState();
         return;
       }
+      const healthData = await health.json();
+      if (healthData.busy) setStatus('Busy', false, false);
       const models = await fetch('/v1/models', { headers: authHeaders(), cache: 'no-store' });
       if (models.status === 401) {
         els.model.textContent = 'Model loaded • API key required';
@@ -269,14 +277,16 @@
     assistantBubble.classList.add('typing');
 
     try {
+      activeController = new AbortController();
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: authHeaders(true),
+        signal: activeController.signal,
         body: JSON.stringify({
           model: 'loaded-model',
           messages,
           stream: true,
-          max_tokens: 2048
+          max_tokens: 1024
         })
       });
 
@@ -320,15 +330,29 @@
       messages.push({ role: 'assistant', content: answer });
     } catch (err) {
       assistantBubble.classList.remove('typing');
-      assistantBubble.classList.add('error');
-      assistantBubble.textContent = err instanceof Error ? err.message : String(err);
+      if (err?.name === 'AbortError') {
+        assistantBubble.textContent = assistantBubble.textContent || 'Generation stopped.';
+      } else {
+        assistantBubble.classList.add('error');
+        assistantBubble.textContent = err instanceof Error ? err.message : String(err);
+      }
     } finally {
+      activeController = null;
       busy = false;
       updateSendState();
       els.prompt.focus();
     }
   }
 
+  async function stopGeneration() {
+    if (!busy) return;
+    activeController?.abort();
+    try {
+      await fetch('/v1/stop', { method: 'POST', headers: authHeaders() });
+    } catch (_) {}
+  }
+
+  els.stop.addEventListener('click', stopGeneration);
   els.saveKey.addEventListener('click', () => {
     apiKey = els.key.value.trim();
     if (apiKey) sessionStorage.setItem('geniex_api_key', apiKey);
@@ -359,7 +383,7 @@
   });
 
   refreshStatus();
-  setInterval(refreshStatus, 5000);
+  setInterval(refreshStatus, 30000);
   growTextarea();
 })();
 </script>

@@ -21,6 +21,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.os.Process
 import android.provider.MediaStore
 import android.util.Log
 import android.view.LayoutInflater
@@ -57,8 +58,10 @@ import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.model.AppPreferences
 import com.geniex.demo.model.ModelManagementActivity
 import com.geniex.demo.server.InferenceBridge
+import com.geniex.demo.server.LocalApiService
 import com.geniex.demo.server.LocalApiServer
 import com.geniex.demo.server.ServerActivity
+import com.geniex.demo.storage.WorkingDirectoryManager
 import com.geniex.demo.utils.ExecShell
 import com.geniex.demo.utils.GgufVisionConfig
 import com.geniex.demo.utils.GgufVisionReader
@@ -112,6 +115,8 @@ class MainActivity : FragmentActivity() {
     private lateinit var btnModels: Button
     private lateinit var btnServer: Button
     private lateinit var btnDiagnostics: Button
+    private lateinit var btnModelPanelToggle: Button
+    private lateinit var llModelPanelContent: LinearLayout
 
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: ChatAdapter
@@ -146,17 +151,30 @@ class MainActivity : FragmentActivity() {
     private val savedImageFiles = mutableListOf<File>()
     private val messages = arrayListOf<Message>()
     private var loadingMessageIndex: Int = -1
+    private var sdkReady = false
+    private var uiReady = false
+    private var nativeRuntimeWasUsed = false
+    private var pendingResumeAttempted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The native model manager reads GENIEX_DATADIR on first use. Never
+        // initialize GenieX until the persistent workspace has been applied.
+        if (!WorkingDirectoryManager.applyConfigured(this)) {
+            startActivity(Intent(this, StartupActivity::class.java))
+            finish()
+            return
+        }
         immersionBar {
             statusBarColorInt(getColor(R.color.bg_normal))
             statusBarDarkFont(true)
         }
         initData()
         initView()
+        uiReady = true
         setListeners()
         showInterruptedLoadWarning()
+        maybeResumePendingModelLoad()
     }
 
     override fun onResume() {
@@ -227,6 +245,10 @@ class MainActivity : FragmentActivity() {
         btnModels = findViewById(R.id.btn_models)
         btnServer = findViewById(R.id.btn_server)
         btnDiagnostics = findViewById(R.id.btn_diagnostics)
+        btnModelPanelToggle = findViewById(R.id.btn_model_panel_toggle)
+        llModelPanelContent = findViewById(R.id.ll_model_panel_content)
+        btnModelPanelToggle.setOnClickListener { toggleModelPanel() }
+        applyModelPanelCollapsedState()
 
         btnSend = findViewById(R.id.btn_send)
         btnSend.isEnabled = false
@@ -261,6 +283,24 @@ class MainActivity : FragmentActivity() {
 
         findViewById<View>(R.id.v_tip).setOnClickListener {
             Toast.makeText(this, "please unload model first", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun toggleModelPanel() {
+        val collapsed = !AppPreferences.isModelPanelCollapsed(this)
+        AppPreferences.setModelPanelCollapsed(this, collapsed)
+        applyModelPanelCollapsedState()
+    }
+
+    private fun applyModelPanelCollapsedState() {
+        if (!::llModelPanelContent.isInitialized || !::btnModelPanelToggle.isInitialized) return
+        val collapsed = AppPreferences.isModelPanelCollapsed(this)
+        llModelPanelContent.visibility = if (collapsed) View.GONE else View.VISIBLE
+        btnModelPanelToggle.text = if (collapsed) "Expand" else "Collapse"
+        btnModelPanelToggle.contentDescription = if (collapsed) {
+            "Expand model controls"
+        } else {
+            "Collapse model controls"
         }
     }
 
@@ -353,7 +393,15 @@ class MainActivity : FragmentActivity() {
             this,
             object : GenieXSdk.InitCallback {
                 override fun onSuccess() {
+                    sdkReady = true
                     DiagnosticsLogger.log("INFO", TAG, "GenieX SDK initialized")
+                    runOnUiThread {
+                        // Re-query the configured persistent cache now that the
+                        // model manager is initialized; this discovers models
+                        // left in the workspace by a previous installation.
+                        refreshSelectedModelUi()
+                        maybeResumePendingModelLoad()
+                    }
                 }
 
                 override fun onFailure(reason: String) {
@@ -365,6 +413,17 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun onLoadModelSuccess(tip: String) {
+        nativeRuntimeWasUsed = true
+        val resumeServer = AppPreferences.consumeResumeServerAfterRestart(this)
+        if (resumeServer && !LocalApiServer.isRunning()) {
+            LocalApiService.start(
+                applicationContext,
+                AppPreferences.getServerPort(this),
+                AppPreferences.isLanEnabled(this),
+                AppPreferences.getApiKey(this),
+            )
+            DiagnosticsLogger.log("INFO", "ApiServer", "foreground server resume requested after model switch")
+        }
         runOnUiThread {
             Toast
                 .makeText(
@@ -423,22 +482,127 @@ class MainActivity : FragmentActivity() {
      */
     private suspend fun isModelDownloaded(modelData: ModelData): Boolean = ModelManagerWrapper.getPaths(modelData.modelName) != null
 
+    private fun maybeResumePendingModelLoad() {
+        if (!sdkReady || !uiReady || pendingResumeAttempted) return
+        if (DiagnosticsLogger.wasModelLoadInterrupted()) {
+            AppPreferences.clearPendingModelLoad(this)
+            return
+        }
+        val pending = AppPreferences.getPendingModelLoad(this) ?: return
+        pendingResumeAttempted = true
+        AppPreferences.clearPendingModelLoad(this)
+        val model = modelList.firstOrNull { it.id == pending.modelId } ?: return
+        AppPreferences.setSelectedModelId(this, model.id)
+        syncSelectedModelFromPreferences()
+        DiagnosticsLogger.checkpoint(
+            "SAFE_RUNTIME_RESUME",
+            "model=${model.modelName} compute=${pending.computeUnit}",
+        )
+        llLoading.visibility = View.VISIBLE
+        vTip.visibility = View.VISIBLE
+        val nGpuLayers = if (pending.computeUnit == ComputeUnitValue.CPU.value) 0 else -1
+        loadModel(
+            selectModelData = model,
+            modelDataPluginId = model.runtime ?: "llama_cpp",
+            nGpuLayers = nGpuLayers,
+            deviceId = pending.computeUnit,
+            bypassFreshRuntimeGuard = true,
+        )
+    }
+
+    private fun restartIntoFreshRuntime(selectModelData: ModelData, computeUnit: String) {
+        AppPreferences.setPendingModelLoad(this, selectModelData.id, computeUnit)
+        DiagnosticsLogger.checkpoint(
+            "SAFE_RUNTIME_RESTART",
+            "model=${selectModelData.modelName} compute=$computeUnit",
+        )
+        val serverWasRunning = LocalApiServer.isRunning()
+        AppPreferences.setResumeServerAfterRestart(this, serverWasRunning)
+        if (serverWasRunning) LocalApiServer.stop()
+        Toast.makeText(this, "Restarting the model engine for a clean switch…", Toast.LENGTH_SHORT).show()
+        startActivity(
+            Intent(this, RuntimeRestartActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            },
+        )
+        finishAffinity()
+        Process.killProcess(Process.myPid())
+    }
+
+    private fun recursiveSizeBytes(file: File): Long {
+        if (!file.exists()) return 0L
+        if (file.isFile) return file.length()
+        return file.listFiles()?.sumOf { recursiveSizeBytes(it) } ?: 0L
+    }
+
     private fun loadModel(
         selectModelData: ModelData,
         modelDataPluginId: String,
         nGpuLayers: Int,
         deviceId: String? = null,
+        bypassFreshRuntimeGuard: Boolean = false,
     ) {
         val requestedCompute = deviceId ?: ComputeUnitValue.NPU.value
+        if (nativeRuntimeWasUsed && !bypassFreshRuntimeGuard && !hasLoadedModel()) {
+            restartIntoFreshRuntime(selectModelData, requestedCompute)
+            return
+        }
         DiagnosticsLogger.markModelLoadStart(
             "model=${selectModelData.modelName} quant=${selectModelData.quant.orEmpty()} runtime=${selectModelData.runtime.orEmpty()} compute=$requestedCompute",
         )
         modelScope.launch {
+            DiagnosticsLogger.modelLoadStage("RESET_LOAD_STATE_BEGIN")
             resetLoadState()
+            DiagnosticsLogger.modelLoadStage("RESET_LOAD_STATE_COMPLETE")
+
+            DiagnosticsLogger.modelLoadStage("PATH_RESOLUTION_BEGIN", "model=${selectModelData.modelName}")
             val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)
             if (paths == null) {
+                DiagnosticsLogger.modelLoadStage("PATH_RESOLUTION_FAILED", "model=${selectModelData.modelName}")
                 onLoadModelFailed("model paths unavailable — pull it first")
                 return@launch
+            }
+            DiagnosticsLogger.modelLoadStage(
+                "PATH_RESOLUTION_COMPLETE",
+                "modelName=${paths.model_name} runtimeId=${paths.runtime_id} modelPath=${paths.model_path} " +
+                    "tokenizerPath=${paths.tokenizer_path} mmprojPath=${paths.mmproj_path.orEmpty()}",
+            )
+            DiagnosticsLogger.recordModelFiles(
+                modelName = selectModelData.modelName,
+                runtimeId = paths.runtime_id.ifEmpty { modelDataPluginId },
+                computeUnit = requestedCompute,
+                modelPath = paths.model_path,
+                tokenizerPath = paths.tokenizer_path,
+                mmprojPath = paths.mmproj_path,
+            )
+
+            val availableBytes = getAvailableMemoryBytes()
+            val modelBytes = recursiveSizeBytes(File(paths.model_path))
+            DiagnosticsLogger.log(
+                "INFO",
+                "Memory",
+                "load preflight model=${selectModelData.displayName} runtime=${paths.runtime_id.ifEmpty { modelDataPluginId }} " +
+                    "compute=$requestedCompute available=${formatGiB(availableBytes)} modelFiles=${formatGiB(modelBytes)}",
+            )
+            DiagnosticsLogger.modelLoadStage(
+                "MEMORY_PREFLIGHT_COMPLETE",
+                "availableBytes=$availableBytes modelBytes=$modelBytes",
+            )
+            selectModelData.minAvailableMemoryGiB?.let { minGiB ->
+                val minimumBytes = (minGiB * GIB_BYTES.toDouble()).toLong()
+                if (availableBytes > 0L && availableBytes < minimumBytes) {
+                    DiagnosticsLogger.modelLoadStage(
+                        "MEMORY_PREFLIGHT_BLOCKED",
+                        "availableBytes=$availableBytes minimumBytes=$minimumBytes reason=model_threshold",
+                    )
+                    onLoadModelFailed(
+                        "Load blocked to prevent another low-memory process kill. " +
+                            "${selectModelData.displayName} has a ${String.format(Locale.US, "%.1f", minGiB)} GiB " +
+                            "recommended free-memory threshold in this build, but Android reports ${formatGiB(availableBytes)}. " +
+                            "Use the GGUF Q4_0 version instead, or close apps/reboot and try again.",
+                    )
+                    return@launch
+                }
             }
 
             // GPU model loading can temporarily require another large chunk of
@@ -447,8 +611,6 @@ class MainActivity : FragmentActivity() {
             // that pressure becomes too high, so preflight the load and prefer
             // a clear error over a low-memory process death.
             if (requestedCompute == ComputeUnitValue.GPU.value) {
-                val availableBytes = getAvailableMemoryBytes()
-                val modelBytes = File(paths.model_path).takeIf { it.isFile }?.length() ?: 0L
                 val recommendedBytes =
                     if (modelBytes > 0L) {
                         modelBytes + maxOf(GPU_MIN_EXTRA_HEADROOM_BYTES, modelBytes / 2)
@@ -462,6 +624,10 @@ class MainActivity : FragmentActivity() {
                         "model=${formatGiB(modelBytes)} recommended=${formatGiB(recommendedBytes)}",
                 )
                 if (availableBytes > 0L && availableBytes < recommendedBytes) {
+                    DiagnosticsLogger.modelLoadStage(
+                        "MEMORY_PREFLIGHT_BLOCKED",
+                        "availableBytes=$availableBytes recommendedBytes=$recommendedBytes reason=gpu_headroom",
+                    )
                     onLoadModelFailed(
                         "GPU load blocked to prevent a low-memory crash. " +
                             "Available ${formatGiB(availableBytes)}; about ${formatGiB(recommendedBytes)} recommended. " +
@@ -471,10 +637,19 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
+            // From here on, a native runtime may allocate accelerator/driver memory even
+            // if builder creation eventually fails. Require a fresh process before the
+            // next attempt so partial native teardown cannot poison a model switch.
+            nativeRuntimeWasUsed = true
+
             // Manifest-written runtime_id wins when present; fall back to
             // the user's UI selection for GGUF models that skip the manifest.
             val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }
             val resolvedDeviceId = deviceId
+            DiagnosticsLogger.modelLoadStage(
+                "RUNTIME_RESOLVED",
+                "pluginId=$pluginId requestedCompute=$requestedCompute deviceId=${resolvedDeviceId.orEmpty()} type=${selectModelData.type}",
+            )
             when (selectModelData.type) {
                 "chat", "llm" -> {
                     // QAIRT rejects non-zero n_ctx / n_gpu_layers (both fixed at compile
@@ -491,25 +666,39 @@ class MainActivity : FragmentActivity() {
                                 enable_thinking = enableThinking,
                             )
                         }
-                    LlmWrapper
-                        .builder()
-                        .llmCreateInput(
-                            LlmCreateInput(
-                                model_name = paths.model_name,
-                                model_path = paths.model_path,
-                                tokenizer_path = paths.tokenizer_path,
-                                config = conf,
-                                runtime_id = pluginId,
-                                compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
-                            ),
-                        ).build()
+                    DiagnosticsLogger.modelLoadStage(
+                        "LLM_CONFIG_READY",
+                        "runtime=$pluginId compute=${resolvedDeviceId ?: ComputeUnitValue.NPU.value} " +
+                            "nCtx=${if (isQairt) 0 else 1024} nGpuLayers=${if (isQairt) 0 else nGpuLayers} thinking=$enableThinking",
+                    )
+                    DiagnosticsLogger.modelLoadStage("LLM_BUILDER_CREATE_BEGIN")
+                    val builder = LlmWrapper.builder()
+                    DiagnosticsLogger.modelLoadStage("LLM_BUILDER_CREATE_COMPLETE")
+                    val createInput = LlmCreateInput(
+                        model_name = paths.model_name,
+                        model_path = paths.model_path,
+                        tokenizer_path = paths.tokenizer_path,
+                        config = conf,
+                        runtime_id = pluginId,
+                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
+                    )
+                    DiagnosticsLogger.modelLoadStage("LLM_CREATE_INPUT_BEGIN")
+                    val configuredBuilder = builder.llmCreateInput(createInput)
+                    DiagnosticsLogger.modelLoadStage("LLM_CREATE_INPUT_COMPLETE")
+                    DiagnosticsLogger.modelLoadStage("LLM_BUILD_ENTER")
+                    configuredBuilder.build()
                         .onSuccess { wrapper ->
+                            DiagnosticsLogger.modelLoadStage("LLM_BUILD_RETURNED_SUCCESS")
                             isLoadLlmModel = true
                             llmWrapper = wrapper
                             InferenceBridge.setLlm(wrapper, selectModelData.id, selectModelData.displayName, requestedCompute)
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
                             onLoadModelSuccess("LLM model loaded")
                         }.onFailure { error ->
+                            DiagnosticsLogger.modelLoadStage(
+                                "LLM_BUILD_RETURNED_FAILURE",
+                                "type=${error::class.java.name} message=${error.message.orEmpty()}",
+                            )
                             onLoadModelFailed(error.message.toString())
                         }
                 }
@@ -550,30 +739,46 @@ class MainActivity : FragmentActivity() {
                                 enable_thinking = enableThinking,
                             )
                         }
-                    VlmWrapper
-                        .builder()
-                        .vlmCreateInput(
-                            VlmCreateInput(
-                                model_name = paths.model_name,
-                                model_path = paths.model_path,
-                                mmproj_path = paths.mmproj_path,
-                                config = config,
-                                runtime_id = pluginId,
-                                compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
-                            ),
-                        ).build()
+                    DiagnosticsLogger.modelLoadStage(
+                        "VLM_CONFIG_READY",
+                        "runtime=$pluginId compute=${resolvedDeviceId ?: ComputeUnitValue.NPU.value} " +
+                            "nCtx=${if (isNpuVlm) 0 else vlmContextSize(vlmVisionConfig)} " +
+                            "nGpuLayers=${if (isNpuVlm) 0 else nGpuLayers} nThreads=${if (isNpuVlm) 8 else 4}",
+                    )
+                    DiagnosticsLogger.modelLoadStage("VLM_BUILDER_CREATE_BEGIN")
+                    val builder = VlmWrapper.builder()
+                    DiagnosticsLogger.modelLoadStage("VLM_BUILDER_CREATE_COMPLETE")
+                    val createInput = VlmCreateInput(
+                        model_name = paths.model_name,
+                        model_path = paths.model_path,
+                        mmproj_path = paths.mmproj_path,
+                        config = config,
+                        runtime_id = pluginId,
+                        compute_unit = resolvedDeviceId ?: ComputeUnitValue.NPU.value,
+                    )
+                    DiagnosticsLogger.modelLoadStage("VLM_CREATE_INPUT_BEGIN")
+                    val configuredBuilder = builder.vlmCreateInput(createInput)
+                    DiagnosticsLogger.modelLoadStage("VLM_CREATE_INPUT_COMPLETE")
+                    DiagnosticsLogger.modelLoadStage("VLM_BUILD_ENTER")
+                    configuredBuilder.build()
                         .onSuccess {
+                            DiagnosticsLogger.modelLoadStage("VLM_BUILD_RETURNED_SUCCESS")
                             isLoadVlmModel = true
                             vlmWrapper = it
                             InferenceBridge.setVlm(it, selectModelData.id, selectModelData.displayName, requestedCompute)
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
                             onLoadModelSuccess("VLM model loaded")
                         }.onFailure { error ->
+                            DiagnosticsLogger.modelLoadStage(
+                                "VLM_BUILD_RETURNED_FAILURE",
+                                "type=${error::class.java.name} message=${error.message.orEmpty()}",
+                            )
                             onLoadModelFailed(error.message.toString())
                         }
                 }
 
                 else -> {
+                    DiagnosticsLogger.modelLoadStage("MODEL_TYPE_UNSUPPORTED", "type=${selectModelData.type}")
                     onLoadModelFailed("model type error")
                 }
             }
@@ -927,7 +1132,7 @@ class MainActivity : FragmentActivity() {
             val handleUnloadResult = fun(result: Int) {
                 resetLoadState()
                 InferenceBridge.clear()
-                DiagnosticsLogger.checkpoint("MODEL_UNLOAD")
+                DiagnosticsLogger.checkpoint("MODEL_UNLOAD", "fresh process required before next model load")
                 chatList.clear()
                 vlmChatList.clear()
                 runOnUiThread {
@@ -1219,7 +1424,9 @@ class MainActivity : FragmentActivity() {
 
         bitmap?.let {
             try {
-                val file = File(filesDir, "chat_${System.currentTimeMillis()}.jpg")
+                val attachmentsDir = WorkingDirectoryManager.workspace(this)?.attachments ?: filesDir
+                attachmentsDir.mkdirs()
+                val file = File(attachmentsDir, "chat_${System.currentTimeMillis()}.jpg")
                 val success = saveBitmapToFile(it, file)
                 if (success) {
                     Log.d(TAG, "Save success: ${file.absolutePath}")
@@ -1239,7 +1446,8 @@ class MainActivity : FragmentActivity() {
         file: File,
     ): Boolean =
         try {
-            val tempDir = File(this.filesDir, "tmp").apply { if (!exists()) mkdirs() }
+            val tempDir = (WorkingDirectoryManager.workspace(this)?.temp ?: File(this.filesDir, "tmp"))
+                .apply { if (!exists()) mkdirs() }
 
             val tempFile =
                 File(

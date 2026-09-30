@@ -125,3 +125,53 @@ A full Android Gradle build still runs in GitHub Actions (`lintDebug` + `assembl
 ## UI v6 resource-link fix
 
 Removed unsupported `insetTop`/`insetBottom` style items from the custom Material button styles. These were causing `processDebugResources` to fail before Kotlin compilation. Button sizing remains controlled by `android:minHeight`, layout margins, and Material button padding.
+
+
+## v7 model-switch stability
+
+- Added controlled fresh-process restart before loading another model after a native runtime has been used.
+- Pending model/backend selection survives the restart and resumes automatically.
+- Added conservative per-model memory preflight for high-memory QAIRT 4B bundles.
+- Added Qwen3 4B GGUF Q4_0 as a lower-risk NPU/GPU/CPU alternative to the QAIRT bundle.
+- Reduced browser status polling from 5s to 15s and downgraded expected socket disconnects to informational logs.
+- The 8 GiB QAIRT threshold is a safety policy based on observed LOW_MEMORY process kills in diagnostics, not an official Qualcomm minimum.
+
+
+## v8 server reliability
+
+Diagnostics from the LAN web chat showed the model process remained alive while HTTP
+traffic stopped after the Android activity went to the background. Earlier sessions also
+showed broken-pipe SSE disconnects and overlapping completion requests. v8 therefore:
+
+- runs the local API as an Android foreground service, with CPU and Wi-Fi locks while enabled;
+- allows only one inference request at a time and returns HTTP 429 to overlapping requests;
+- adds `POST /v1/stop` and `/stop` to cancel the active stream;
+- adds a Stop button and AbortController to the browser chat;
+- avoids status polling during generation and polls every 30 seconds when idle;
+- shortens idle client socket timeouts so abandoned browser connections cannot pin workers; and
+- keeps six HTTP workers so health/model requests remain responsive during a generation.
+
+## v9 workspace + model-management UX
+
+- Added first-run `StartupActivity` for a persistent user-selected working directory.
+- The app requests Android All files access because GenieX native runtimes require POSIX filesystem paths for model weights.
+- Sets `GENIEX_DATADIR` before GenieX SDK/model-manager initialization, so models are stored under `<workspace>/models` and are rediscovered when the same workspace is selected after reinstall.
+- Persistent workspace folders: `models/`, `aihub/`, `logs/`, `diagnostics/`, `attachments/`, and `temp/`.
+- Diagnostics logs and exported ZIPs now live in the workspace. Sharing uses a temporary cache copy so FileProvider does not expose the whole workspace.
+- Model cards no longer show Delete for unavailable models.
+- RecyclerView change animation is disabled for the model list so download percentage updates do not flash/pulse the whole card.
+- The main model control panel is collapsible/expandable and remembers its state.
+
+Android removes app preferences and URI grants on uninstall. The shared workspace files remain, but after reinstall the user must select the same workspace again once. The model manager then detects its existing cache.
+
+
+## v10 enhanced model-loader diagnostics
+
+- Persistent model-load stage checkpoints are synchronously flushed before native runtime transitions.
+- `logs/memory.csv` samples system/app/native/JVM memory every 500 ms while a model is loading.
+- `logs/native-runtime.log` snapshots this app process' logcat approximately every two seconds during model initialization.
+- `logs/model-loader.log` records resolved model paths, runtime/backend configuration, file sizes, and builder stages.
+- `logs/api-server.log` isolates API/server chatter from the main app log.
+- On the next launch, the most recent Android `ApplicationExitInfo` is correlated with the last persisted model-load stage.
+- Exported diagnostic ZIPs include all of the above plus current logcat and process-exit traces.
+- Prompt/response bodies and API credentials are not intentionally logged by app-level diagnostics. Native SDK log output is captured as emitted by the SDK/runtime.
