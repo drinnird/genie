@@ -11,6 +11,7 @@ import com.geniex.demo.databinding.ItemModelManagementBinding
 data class ModelUiState(
     val model: ModelData,
     val available: Boolean = false,
+    val persistentFilesPresent: Boolean = false,
     val loaded: Boolean = false,
     val blockedByActiveModel: Boolean = false,
     val downloading: Boolean = false,
@@ -57,6 +58,7 @@ class ModelManagementAdapter(
                 state.loaded -> "Active"
                 state.available && state.blockedByActiveModel -> "Available • unload active model to switch"
                 state.available -> "Available • ready to load"
+                state.persistentFilesPresent -> "Stored files • incomplete or incompatible"
                 else -> "Not downloaded"
             }
 
@@ -78,8 +80,10 @@ class ModelManagementAdapter(
             // locally. Once downloaded the action appears; active models keep
             // it visible but disabled until unloaded.
             binding.btnModelDelete.visibility =
-                if (state.available && !state.downloading) android.view.View.VISIBLE else android.view.View.GONE
-            binding.btnModelDelete.isEnabled = state.available && !state.loaded && !state.downloading
+                if ((state.available || state.persistentFilesPresent) && !state.downloading) android.view.View.VISIBLE
+                else android.view.View.GONE
+            binding.btnModelDelete.isEnabled =
+                (state.available || state.persistentFilesPresent) && !state.loaded && !state.downloading
             binding.btnModelDelete.setOnClickListener { onDelete(model) }
         }
     }

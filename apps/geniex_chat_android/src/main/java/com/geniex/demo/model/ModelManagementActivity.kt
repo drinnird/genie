@@ -3,7 +3,6 @@ package com.geniex.demo.model
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
-import android.os.PowerManager
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.FragmentActivity
@@ -17,11 +16,8 @@ import com.geniex.demo.storage.WorkingDirectoryManager
 import com.geniex.sdk.GenieXSdk
 import com.geniex.sdk.ModelManagerWrapper
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
@@ -32,7 +28,6 @@ class ModelManagementActivity : FragmentActivity() {
     private lateinit var adapter: ModelManagementAdapter
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var states: List<ModelUiState> = emptyList()
-    private var downloadJob: Job? = null
     @Volatile private var sdkReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,6 +49,7 @@ class ModelManagementActivity : FragmentActivity() {
         binding.rvModels.itemAnimator = null
         binding.rvModels.adapter = adapter
         binding.btnModelsBack.setOnClickListener { finish() }
+        observeDownloadState()
         GenieXSdk.getInstance().init(
             this,
             object : GenieXSdk.InitCallback {
@@ -78,7 +74,8 @@ class ModelManagementActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
-        downloadJob?.cancel()
+        // Downloads are owned by ModelDownloadService and deliberately survive
+        // this Activity being destroyed/backgrounded.
         scope.cancel()
         super.onDestroy()
     }
@@ -86,17 +83,26 @@ class ModelManagementActivity : FragmentActivity() {
     private fun refreshStates() {
         scope.launch {
             val activeId = InferenceBridge.activeModelId
+            val download = ModelDownloadService.currentState()
             val refreshed = models.map { model ->
                 val old = states.firstOrNull { it.model.id == model.id }
-                val available = ModelManagerWrapper.getPaths(model.modelName) != null
+                val available = ModelPathResolver.isAvailable(this@ModelManagementActivity, model)
+                val persistentFilesPresent =
+                    ModelDownloadCoordinator.hasPersistentDownloadFiles(this@ModelManagementActivity, model)
+                val thisDownload = download.modelId == model.id
                 ModelUiState(
                     model = model,
                     available = available,
+                    persistentFilesPresent = persistentFilesPresent,
                     loaded = model.id == activeId,
                     blockedByActiveModel = activeId != null && activeId != model.id,
-                    downloading = old?.downloading == true,
-                    progress = old?.progress,
-                    error = old?.error,
+                    downloading = thisDownload && download.isRunning,
+                    progress = if (thisDownload && download.isRunning) download.percent else old?.progress,
+                    error = when {
+                        thisDownload && download.status == ModelDownloadService.Status.FAILED -> download.message
+                        thisDownload -> null
+                        else -> old?.error
+                    },
                 )
             }
             updateStates(refreshed)
@@ -104,8 +110,17 @@ class ModelManagementActivity : FragmentActivity() {
     }
 
     private fun downloadModel(model: ModelData) {
-        if (downloadJob?.isActive == true) {
-            Toast.makeText(this, "Another model is already downloading.", Toast.LENGTH_SHORT).show()
+        val active = ModelDownloadService.currentState()
+        if (active.isRunning) {
+            Toast.makeText(
+                this,
+                "${active.displayName ?: "Another model"} is already downloading in the background.",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        ModelDownloadCoordinator.compatibilityError(model)?.let { message ->
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
         }
         if (ModelDownloadCoordinator.isAiHub(model) && model.chipset.isNullOrBlank()) {
@@ -113,87 +128,22 @@ class ModelManagementActivity : FragmentActivity() {
             return
         }
         setState(model.id) { it.copy(downloading = true, progress = 0, error = null) }
-        DiagnosticsLogger.checkpoint("MODEL_DOWNLOAD_BEGIN", "${model.modelName}:${model.quant.orEmpty()}")
+        ModelDownloadService.start(this, model)
+    }
 
-        val wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "geniex:model_management_download")
-        wakeLock.acquire(DOWNLOAD_WAKELOCK_TIMEOUT_MS)
-        val newDownloadJob = scope.launch(start = CoroutineStart.LAZY) {
-            val thisJob = coroutineContext[Job]
-            try {
-                ModelDownloadCoordinator.downloadFlow(this@ModelManagementActivity, model).collect { event ->
-                    when (event) {
-                        is ModelDownloadCoordinator.Event.Progress -> {
-                            if (states.firstOrNull { it.model.id == model.id }?.progress != event.percent) {
-                                setState(model.id) {
-                                    it.copy(downloading = true, progress = event.percent, error = null)
-                                }
-                            }
-                        }
-                        is ModelDownloadCoordinator.Event.Completed -> {
-                            val paths = ModelManagerWrapper.getPaths(model.modelName)
-                            val persistent = WorkingDirectoryManager.isPersistentModelPath(
-                                this@ModelManagementActivity,
-                                paths?.model_path,
-                            )
-                            DiagnosticsLogger.checkpoint(
-                                "MODEL_DOWNLOAD_COMPLETE",
-                                "${model.modelName} path=${paths?.model_path.orEmpty()} persistent=$persistent",
-                            )
-                            setState(model.id) {
-                                it.copy(
-                                    available = paths != null,
-                                    downloading = false,
-                                    progress = 100,
-                                    error = if (paths != null && !persistent) {
-                                        "Model downloaded outside Genie/models; export diagnostics before reinstalling."
-                                    } else {
-                                        null
-                                    },
-                                )
-                            }
-                            runOnUiThread {
-                                val message = if (persistent) {
-                                    "${model.displayName} is ready in Genie/models."
-                                } else {
-                                    "${model.displayName} downloaded, but storage verification failed."
-                                }
-                                Toast.makeText(
-                                    this@ModelManagementActivity,
-                                    message,
-                                    if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                        }
-                        is ModelDownloadCoordinator.Event.Error -> {
-                            DiagnosticsLogger.log(
-                                "ERROR",
-                                "ModelDownload",
-                                "${model.modelName}: ${event.code ?: "http"} ${event.message}",
-                            )
-                            setState(model.id) { it.copy(downloading = false, error = event.message) }
-                            runOnUiThread {
-                                Toast.makeText(
-                                    this@ModelManagementActivity,
-                                    "Download failed: ${event.message}",
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                        }
+    private fun observeDownloadState() {
+        scope.launch {
+            ModelDownloadService.state.collect { download ->
+                val modelId = download.modelId ?: return@collect
+                if (download.isRunning) {
+                    setState(modelId) {
+                        it.copy(downloading = true, progress = download.percent, error = null)
                     }
+                } else {
+                    refreshStates()
                 }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (e: Exception) {
-                DiagnosticsLogger.log("ERROR", "ModelDownload", model.modelName, e)
-                setState(model.id) { it.copy(downloading = false, error = e.message ?: "download failed") }
-            } finally {
-                if (wakeLock.isHeld) wakeLock.release()
-                if (downloadJob === thisJob) downloadJob = null
             }
         }
-        downloadJob = newDownloadJob
-        newDownloadJob.start()
     }
 
     private fun selectModel(model: ModelData) {
@@ -228,10 +178,18 @@ class ModelManagementActivity : FragmentActivity() {
 
     private fun deleteModel(model: ModelData) {
         scope.launch {
-            val result = runCatching { ModelManagerWrapper.remove(model.modelName) }
+            val result = runCatching {
+                if (ModelDownloadCoordinator.usesPersistentDirectDownload(model)) {
+                    val sdkCopyExists = runCatching { ModelManagerWrapper.getPaths(model.modelName) }.getOrNull() != null
+                    val localDeleted = ModelDownloadCoordinator.deletePersistentDownload(this@ModelManagementActivity, model)
+                    val sdkCode = if (sdkCopyExists) ModelManagerWrapper.remove(model.modelName) else 0
+                    if (localDeleted && sdkCode == 0) 0 else if (sdkCode != 0) sdkCode else -1
+                } else {
+                    ModelManagerWrapper.remove(model.modelName)
+                }
+            }
             result.onSuccess { code ->
                 DiagnosticsLogger.checkpoint("MODEL_DELETE", "${model.modelName} rc=$code")
-                if (code == 0) ModelDownloadCoordinator.discardStaging(this@ModelManagementActivity, model)
                 runOnUiThread {
                     if (code == 0) Toast.makeText(this@ModelManagementActivity, "Model deleted.", Toast.LENGTH_SHORT).show()
                     else Toast.makeText(this@ModelManagementActivity, "Delete failed (code $code).", Toast.LENGTH_LONG).show()
@@ -269,6 +227,5 @@ class ModelManagementActivity : FragmentActivity() {
         const val EXTRA_MODEL_ACTION = "model_action"
         const val ACTION_LOAD = "load"
         const val ACTION_UNLOAD = "unload"
-        private const val DOWNLOAD_WAKELOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L
     }
 }

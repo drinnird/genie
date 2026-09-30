@@ -90,8 +90,21 @@
     "runtime": "llama_cpp"
   },
   {
+    "id": "Qwen3-VL-4B-Instruct-QAIRT",
+    "displayName": "Qwen3-VL 4B Instruct (Qualcomm NPU • W4A16)",
+    "modelName": "ai-hub-models/Qwen3-VL-4B-Instruct",
+    "hub": "HUGGINGFACE",
+    "type": "vlm",
+    "runtime": "qairt",
+    "quant": "w4a16",
+    "minAvailableMemoryGiB": 8.0,
+    "downloadSource": "QUALCOMM_HF_QAIRT",
+    "qualcommHfRepo": "qualcomm/Qwen3-VL-4B-Instruct",
+    "qualcommPrecision": "w4a16"
+  },
+  {
     "id": "Qwen3-4B",
-    "displayName": "Qwen3 4B (AI Hub \u2022 high memory)",
+    "displayName": "Qwen3 4B (AI Hub • high memory)",
     "modelName": "ai-hub-models/Qwen3-4B",
     "hub": "AUTO",
     "chipset": "SM8750",
@@ -101,12 +114,15 @@
   },
   {
     "id": "Qwen3-4B-Instruct-2507",
-    "displayName": "Qwen3 4B Instruct 2507 (AI Hub \u2022 high memory)",
+    "displayName": "Qwen3 4B Instruct 2507 (Qualcomm NPU • W4A16)",
     "modelName": "ai-hub-models/Qwen3-4B-Instruct-2507",
-    "hub": "AUTO",
-    "chipset": "SM8750",
+    "hub": "HUGGINGFACE",
     "type": "chat",
     "runtime": "qairt",
-    "minAvailableMemoryGiB": 8.0
+    "minAvailableMemoryGiB": 8.0,
+    "quant": "w4a16",
+    "downloadSource": "QUALCOMM_HF_QAIRT",
+    "qualcommHfRepo": "qualcomm/Qwen3-4B-Instruct-2507",
+    "qualcommPrecision": "w4a16"
   }
 ]

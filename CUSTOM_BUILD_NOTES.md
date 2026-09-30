@@ -31,7 +31,7 @@ The uploaded 0.37.2 source pins:
 - targetSdk 34
 - minSdk 31
 - NDK 27.3.13750724
-- GenieX Android 0.3.5
+- GenieX Android 0.4.0
 
 The included GitHub Actions workflow uses Gradle 8.13 and installs Android platform 34, Build Tools 35.0.0, and NDK 27.3.13750724.
 
@@ -306,3 +306,28 @@ refresh helpers.
 - Removed unreferenced legacy `FileContentActivity`, `KeyboardUtil`, `SharePreferenceKeys`, its layout/manifest entry, and unused drawable/color/string/style resources.
 - Static re-audit passes: shell syntax, JSON parsing, all project XML parsing, manifest-to-class checks, local resource-reference checks, deleted-reference sweep, and Kotlin parser sweep. The new download coordinator also compiles in isolation against API-compatible Android/GenieX stubs and passes helper tests for quant matching, split-shard ordering, range parsing, and staging names.
 - A full Android `lintDebug assembleDebug` still cannot be executed in this sandbox because Gradle/Android SDK are not installed and external binary downloads are unavailable here. The repository's GitHub Actions build remains the authoritative full dependency/Android compile and lint gate.
+
+
+## v21 foreground persistent downloads
+
+- Moves model-download ownership out of `MainActivity`/`ModelManagementActivity` into a dedicated Android `dataSync` foreground service. Switching apps, locking the screen, or removing the UI task no longer cancels an active model transfer.
+- The foreground service owns a partial CPU wake lock, publishes progress/cancel notification state, and uses `START_REDELIVER_INTENT` so an OS-recreated service can restart the same request and resume its `.part` file.
+- Public Hugging Face GGUFs now stream directly into `Genie/models/local/<model>/`; there is no duplicate persistent-cache copy and no native `LOCALFS` registration step. The runtime resolves and loads the verified GGUF path directly.
+- The completed-file marker lists every required GGUF. Split models are considered available only when all expected shards exist; VLM availability also requires the selected `mmproj` file.
+- Existing v20 full/partial files under `Genie/temp/huggingface/` are migrated/reused when possible rather than downloaded again.
+- Transient transfer I/O failures retry up to five attempts with resumable HTTP `Range` requests and bounded backoff.
+- Explicit in-app model deletion removes the direct persistent model directory, any legacy v20 staging files, and an older SDK-managed copy when present. Completed persistent models are never removed by stale-part cleanup.
+- Manifest declares `FOREGROUND_SERVICE_DATA_SYNC`, the download service is non-exported and `stopWithTask=false`, and the existing All Files Access model-storage design remains intact.
+
+
+## v22 Qualcomm Hugging Face NPU bundles
+
+- Upgraded the Android GenieX dependency to `com.qualcomm.qti:geniex-android:0.4.0` and updated model-create call sites to the current Android `LlmCreateInput` / `VlmCreateInput` signatures. Thinking mode remains supplied through `applyChatTemplate(...)`.
+- Added a dedicated `QUALCOMM_HF_QAIRT` catalog/download path for Qualcomm-published, precompiled GenieX QAIRT bundles. The app resolves the current package dynamically from each official Qualcomm Hugging Face repo's `release_assets.json` instead of pinning a release/S3 URL.
+- Hardware selection is restricted to Snapdragon SM8750 and SM8850. The resolver prefers the current `*-for-galaxy` asset key and can fall back to the corresponding generic chipset key when Qualcomm's release metadata uses the older name.
+- Enabled the new path for `Qwen3-4B-Instruct-2507` and added a separate `Qwen3-VL-4B-Instruct (Qualcomm NPU • W4A16)` entry. Existing GGUF entries and the older base `Qwen3-4B` AI Hub entry are otherwise unchanged.
+- QAIRT packages use the existing foreground resumable HTTPS service. The transport ZIP is staged with `.part` resume support, safely extracted with zip-slip/entry-count/expanded-size guards, validated for `metadata.json` and compiled `.bin` files, and then removed after successful extraction.
+- The extracted QAIRT bundle is the persistent authoritative copy under `Genie/models/qualcomm-qairt/`; it survives app uninstall/reinstall with the shared workspace and is deleted only by the explicit in-app Delete action.
+- A completed bundle records the target chipset. A bundle copied from an incompatible chipset is not offered for loading, but its persistent files remain visible to the delete path so the user can explicitly remove and replace it.
+- QAIRT memory preflight measures the whole extracted bundle directory instead of only its small tokenizer/metadata anchor file.
+- Non-NPU-optimized downloads retain their v21 behavior.

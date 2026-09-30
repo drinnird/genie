@@ -8,8 +8,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <!-- Android 13+ notification permission for the foreground API-server status notification. -->
+    <!-- Android 13+ notification permission for foreground model-download and API-server status notifications. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Needed because GenieX native runtimes require direct filesystem paths for a user-selected persistent workspace. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
@@ -30,6 +31,11 @@
         <activity
             android:name=".model.ModelManagementActivity"
             android:exported="false" />
+        <service
+            android:name=".model.ModelDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
         <service
             android:name=".server.LocalApiService"
             android:exported="false"

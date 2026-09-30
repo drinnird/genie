@@ -2,6 +2,7 @@ package com.geniex.demo.model
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import com.geniex.demo.bean.ModelData
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.storage.WorkingDirectoryManager
@@ -16,8 +17,10 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.zip.ZipException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
@@ -27,11 +30,12 @@ import org.json.JSONObject
 /**
  * Central model-download path used by both the chat screen and Models screen.
  *
- * Public Hugging Face GGUF models are downloaded with ordinary HTTPS into a
- * resumable staging directory and then imported into GenieX via LOCALFS. This
- * avoids the native Hugging Face downloader while still letting GenieX own its
- * cache metadata and final model layout. Other hubs continue to use the native
- * model-manager pull path.
+ * Public Hugging Face GGUF models are downloaded with ordinary HTTPS directly
+ * into the persistent Genie/models/local store. Verified Qualcomm Hugging Face
+ * entries resolve their published release_assets.json and install the matching
+ * precompiled GenieX QAIRT bundle into persistent shared storage. Both paths are
+ * loaded directly and avoid a duplicate multi-gigabyte SDK cache copy. Other
+ * hubs continue to use the native model-manager pull path.
  */
 object ModelDownloadCoordinator {
     sealed interface Event {
@@ -42,13 +46,20 @@ object ModelDownloadCoordinator {
 
     fun downloadFlow(context: Context, model: ModelData): Flow<Event> = flow {
         try {
-            if (usesStandardHuggingFaceDownload(model)) {
-                downloadHuggingFaceGguf(context, model) { percent ->
-                    emit(Event.Progress(percent.coerceIn(0, 99)))
+            when {
+                usesQualcommHfQairtDownload(model) -> {
+                    downloadQualcommHfQairt(context, model) { percent ->
+                        emit(Event.Progress(percent.coerceIn(0, 99)))
+                    }
+                    emit(Event.Completed)
                 }
-                emit(Event.Completed)
-            } else {
-                nativePull(model).collect { emit(it) }
+                usesStandardHuggingFaceDownload(model) -> {
+                    downloadHuggingFaceGguf(context, model) { percent ->
+                        emit(Event.Progress(percent.coerceIn(0, 99)))
+                    }
+                    emit(Event.Completed)
+                }
+                else -> nativePull(model).collect { emit(it) }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -63,12 +74,62 @@ object ModelDownloadCoordinator {
         return hub == HubSource.HUGGINGFACE && model.runtime == "llama_cpp"
     }
 
-    fun discardStaging(context: Context, model: ModelData) {
-        val temp = WorkingDirectoryManager.workspace(context)?.temp ?: return
-        deleteRecursivelyBestEffort(File(File(temp, "huggingface"), stagingDirectoryName(model)))
+    fun usesQualcommHfQairtDownload(model: ModelData): Boolean =
+        model.downloadSource.equals(QUALCOMM_HF_QAIRT, ignoreCase = true) &&
+            model.runtime == "qairt" &&
+            !model.qualcommHfRepo.isNullOrBlank()
+
+    fun usesPersistentDirectDownload(model: ModelData): Boolean =
+        usesStandardHuggingFaceDownload(model) || usesQualcommHfQairtDownload(model)
+
+    fun hasPersistentDownloadFiles(context: Context, model: ModelData): Boolean {
+        if (!usesPersistentDirectDownload(model)) return false
+        val dir = if (usesQualcommHfQairtDownload(model)) {
+            QairtBundleStore.directory(context, model)
+        } else {
+            ModelLocalStore.directory(context, model)
+        }
+        if (dir?.walkTopDown()?.any { it.isFile } == true) return true
+
+        // v21 may have an SDK-managed copy of the model under the same model
+        // name. For newly direct-managed QAIRT entries, expose Delete for that
+        // legacy copy but never treat it as the new chipset-verified bundle.
+        return usesQualcommHfQairtDownload(model) &&
+            runCatching { ModelManagerWrapper.getPaths(model.modelName) }.getOrNull() != null
+    }
+
+    fun compatibilityError(model: ModelData): String? {
+        if (!usesQualcommHfQairtDownload(model)) return null
+        val target = detectQualcommMobileTarget()
+        return if (target == null) {
+            "This Qualcomm NPU package requires Snapdragon SM8750 or SM8850. " +
+                "Detected SoC: ${Build.SOC_MODEL.orEmpty().ifBlank { "unknown" }}."
+        } else {
+            null
+        }
+    }
+
+    fun isQualcommBundleCompatible(chipsetKey: String): Boolean {
+        val target = detectQualcommMobileTarget() ?: return false
+        return target.assetKeys.any { it.equals(chipsetKey, ignoreCase = true) }
+    }
+
+    fun deletePersistentDownload(context: Context, model: ModelData): Boolean =
+        if (usesQualcommHfQairtDownload(model)) QairtBundleStore.delete(context, model)
+        else deleteStandardDownload(context, model)
+
+    /** Explicitly remove a standard HTTPS model and any resumable partial files. */
+    fun deleteStandardDownload(context: Context, model: ModelData): Boolean {
+        val localDeleted = ModelLocalStore.delete(context, model)
+        val legacyDir = WorkingDirectoryManager.workspace(context)?.temp?.let { temp ->
+            File(File(temp, "huggingface"), ModelLocalStore.directoryName(model))
+        }
+        val legacyDeleted = legacyDir == null || !legacyDir.exists() || legacyDir.deleteRecursively()
+        return localDeleted && legacyDeleted
     }
 
     fun isAiHub(model: ModelData): Boolean {
+        if (usesQualcommHfQairtDownload(model)) return false
         val hub = parseHub(model)
         val name = model.modelName
         return hub == HubSource.AIHUB ||
@@ -106,6 +167,187 @@ object ModelDownloadCoordinator {
         }
     }
 
+    private suspend fun downloadQualcommHfQairt(
+        context: Context,
+        model: ModelData,
+        onProgress: suspend (Int) -> Unit,
+    ) {
+        val workspace = WorkingDirectoryManager.workspace(context)
+            ?: error("No Genie workspace is configured")
+        QairtBundleStore.resolve(context, model)?.let { existing ->
+            if (!isQualcommBundleCompatible(existing.chipsetKey)) {
+                error(
+                    "The installed NPU package targets ${existing.chipsetKey}, which does not match this device. " +
+                        "Delete that model in GenieX, then download the compatible package.",
+                )
+            }
+            onProgress(100)
+            return
+        }
+
+        val destinationDir = QairtBundleStore.directory(context, model)
+            ?: error("No persistent model directory is available")
+        if (!destinationDir.exists() && !destinationDir.mkdirs()) {
+            error("Could not create model directory: ${destinationDir.absolutePath}")
+        }
+        QairtBundleStore.clearInstallArtifacts(context, model)
+
+        val asset = resolveQualcommQairtAsset(model)
+        DiagnosticsLogger.checkpoint(
+            "MODEL_QAIRT_ASSET_RESOLVED",
+            "${model.modelName} chipset=${asset.chipsetKey} qairt=${asset.qairtVersion.orEmpty()} version=${asset.releaseVersion.orEmpty()}",
+        )
+
+        val finalZip = QairtBundleStore.packageFile(context, model)
+            ?: error("No QAIRT package path is available")
+        val partZip = QairtBundleStore.partFile(context, model)
+            ?: error("No QAIRT partial package path is available")
+        val remote = RemoteFile(
+            fileName = asset.downloadUrl.path.substringAfterLast('/').ifBlank { "package.zip" },
+            url = asset.downloadUrl,
+            size = probeRemoteSize(asset.downloadUrl),
+        )
+        preflightStorage(workspace.root, remote, finalZip, partZip)
+
+        if (finalZip.exists() && remote.size > 0L && finalZip.length() != remote.size) {
+            if (!finalZip.delete()) error("Could not replace incomplete QAIRT package")
+        }
+        if (!finalZip.exists()) {
+            downloadOneFile(remote, partZip, finalZip) { bytes ->
+                val percent = if (remote.size > 0L) ((bytes * 84L) / remote.size).toInt() else 0
+                onProgress(percent.coerceIn(0, 84))
+            }
+        }
+        onProgress(85)
+
+        try {
+            QairtBundleStore.installFromZip(
+                context = context,
+                model = model,
+                chipsetKey = asset.chipsetKey,
+                zipFile = finalZip,
+            ) { extractionPercent ->
+                onProgress((85 + (extractionPercent * 14 / 100)).coerceIn(85, 99))
+            }
+        } catch (e: ZipException) {
+            // Do not keep retrying a corrupt completed transport archive. A
+            // fresh Retry will resume/redownload from the authoritative asset.
+            finalZip.delete()
+            throw e
+        }
+
+        val resolved = QairtBundleStore.resolve(context, model)
+            ?: error("Installed QAIRT bundle failed completion verification")
+        // The extracted bundle is the persistent authoritative copy. The ZIP is
+        // only transport/staging and is removed after a successful install.
+        finalZip.delete()
+        partZip.delete()
+        DiagnosticsLogger.checkpoint(
+            "MODEL_QAIRT_DOWNLOAD_COMPLETE",
+            "${model.modelName} model=${resolved.modelPath} chipset=${resolved.chipsetKey} persistent=true",
+        )
+        onProgress(100)
+    }
+
+    private fun resolveQualcommQairtAsset(model: ModelData): QualcommQairtAsset {
+        val repo = model.qualcommHfRepo?.trim().orEmpty()
+        if (repo.isBlank()) error("Qualcomm Hugging Face repository is not configured for ${model.displayName}")
+        if (!repo.startsWith("qualcomm/", ignoreCase = true)) {
+            error("Refusing non-Qualcomm QAIRT asset repository: $repo")
+        }
+        val target = detectQualcommMobileTarget()
+            ?: error(
+                "No compatible Qualcomm mobile NPU target was detected. " +
+                    "GenieX QAIRT downloads currently support SM8750 and SM8850 in this build. " +
+                    "Detected SoC: ${Build.SOC_MODEL.orEmpty().ifBlank { "unknown" }}",
+            )
+        val precision = model.qualcommPrecision?.trim().orEmpty().ifBlank { "w4a16" }
+        val releaseUrl = huggingFaceResolveUrl(repo, "release_assets.json")
+        val root = JSONObject(readText(releaseUrl))
+        val precisionObject = root.optJSONObject("precisions")?.optJSONObject(precision)
+            ?: error("$repo does not publish a $precision pre-exported asset")
+
+        for (chipsetKey in target.assetKeys) {
+            val chipsetObject = findJsonObjectByKey(precisionObject, chipsetKey) ?: continue
+            val runtimeObject = chipsetObject.optJSONObject("geniex_qairt") ?: continue
+            val download = runtimeObject.optString("download_url").trim()
+            if (download.isBlank()) continue
+            val url = URL(download)
+            validateQualcommAssetUrl(url)
+            val qairtVersion = runtimeObject.optJSONObject("tool_versions")?.optString("qairt")?.trim()
+            return QualcommQairtAsset(
+                chipsetKey = chipsetKey,
+                downloadUrl = url,
+                qairtVersion = qairtVersion,
+                releaseVersion = root.optString("version").trim().takeIf { it.isNotBlank() },
+            )
+        }
+        error(
+            "$repo does not currently publish a GenieX QAIRT $precision package for ${target.displayName}. " +
+                "The non-NPU/GGUF entries remain available.",
+        )
+    }
+
+    private fun findJsonObjectByKey(root: JSONObject, wantedKey: String): JSONObject? {
+        root.optJSONObject(wantedKey)?.let { return it }
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val child = root.optJSONObject(key) ?: continue
+            findJsonObjectByKey(child, wantedKey)?.let { return it }
+        }
+        return null
+    }
+
+    private fun detectQualcommMobileTarget(): QualcommMobileTarget? {
+        val signals = listOf(Build.SOC_MODEL.orEmpty(), Build.HARDWARE.orEmpty(), Build.BOARD.orEmpty(), Build.DEVICE.orEmpty())
+            .joinToString(" ")
+            .uppercase(Locale.US)
+        val isSamsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true) ||
+            Build.BRAND.equals("samsung", ignoreCase = true)
+        return when {
+            "SM8850" in signals -> QualcommMobileTarget(
+                displayName = if (isSamsung) {
+                    "Snapdragon 8 Elite Gen 5 For Galaxy Mobile"
+                } else {
+                    "Snapdragon 8 Elite Gen 5 Mobile"
+                },
+                assetKeys = if (isSamsung) {
+                    listOf(
+                        "qualcomm-snapdragon-8-elite-gen5-for-galaxy",
+                        "qualcomm-snapdragon-8-elite-gen5",
+                    )
+                } else {
+                    listOf("qualcomm-snapdragon-8-elite-gen5")
+                },
+            )
+            "SM8750" in signals -> QualcommMobileTarget(
+                displayName = if (isSamsung) {
+                    "Snapdragon 8 Elite For Galaxy Mobile"
+                } else {
+                    "Snapdragon 8 Elite Mobile"
+                },
+                assetKeys = if (isSamsung) {
+                    listOf(
+                        "qualcomm-snapdragon-8-elite-for-galaxy",
+                        "qualcomm-snapdragon-8-elite",
+                    )
+                } else {
+                    listOf("qualcomm-snapdragon-8-elite")
+                },
+            )
+            else -> null
+        }
+    }
+
+    private fun validateQualcommAssetUrl(url: URL) {
+        if (!url.protocol.equals("https", ignoreCase = true)) error("Qualcomm asset URL must use HTTPS")
+        val host = url.host.lowercase(Locale.US)
+        if (!host.startsWith("qaihub-public-assets.") || !host.endsWith(".amazonaws.com")) {
+            error("Unexpected Qualcomm asset host: ${url.host}")
+        }
+    }
+
     private suspend fun downloadHuggingFaceGguf(
         context: Context,
         model: ModelData,
@@ -113,25 +355,37 @@ object ModelDownloadCoordinator {
     ) {
         val workspace = WorkingDirectoryManager.workspace(context)
             ?: error("No Genie workspace is configured")
-        val stagingRoot = File(workspace.temp, "huggingface")
-        val stagingDir = File(stagingRoot, stagingDirectoryName(model))
-        cleanupStaleDownloads(stagingRoot, stagingDir)
-        if (!stagingDir.exists() && !stagingDir.mkdirs()) {
-            error("Could not create download staging directory: ${stagingDir.absolutePath}")
+        ModelLocalStore.resolve(context, model)?.let {
+            onProgress(100)
+            return
         }
+
+        val destinationDir = ModelLocalStore.directory(context, model)
+            ?: error("No persistent model directory is available")
+        if (!destinationDir.exists() && !destinationDir.mkdirs()) {
+            error("Could not create model directory: ${destinationDir.absolutePath}")
+        }
+        migrateLegacyV20Download(workspace.temp, destinationDir, model)
+        ModelLocalStore.resolve(context, model)?.let {
+            onProgress(100)
+            return
+        }
+        cleanupStalePartialDownloads(File(workspace.models, "local"), destinationDir)
+        ModelLocalStore.clearCompletionMarker(context, model)
 
         val fileNames = resolveRepositoryFiles(model)
         if (fileNames.isEmpty()) error("No matching GGUF files found in ${model.modelName}")
 
         val remoteFiles = fileNames.map { fileName ->
+            val url = huggingFaceResolveUrl(model.modelName, fileName)
             RemoteFile(
                 fileName = fileName,
-                url = huggingFaceResolveUrl(model.modelName, fileName),
-                size = probeRemoteSize(huggingFaceResolveUrl(model.modelName, fileName)),
+                url = url,
+                size = probeRemoteSize(url),
             )
         }
 
-        preflightStorage(workspace.root, stagingDir, remoteFiles)
+        preflightStorage(workspace.root, destinationDir, remoteFiles)
         val totalBytes = remoteFiles.map { it.size }.takeIf { sizes -> sizes.all { it > 0L } }?.sum() ?: -1L
         var completedBytes = 0L
         var lastReportedPercent = -1
@@ -143,10 +397,11 @@ object ModelDownloadCoordinator {
             }
         }
 
+        val completedFiles = mutableListOf<File>()
         remoteFiles.forEachIndexed { index, remote ->
             currentCoroutineContext().ensureActive()
-            val finalFile = File(stagingDir, File(remote.fileName).name)
-            val partFile = File(stagingDir, finalFile.name + ".part")
+            val finalFile = File(destinationDir, File(remote.fileName).name)
+            val partFile = File(destinationDir, finalFile.name + ".part")
 
             if (finalFile.exists() && remote.size > 0L && finalFile.length() != remote.size) {
                 if (!finalFile.delete()) error("Could not replace incomplete ${finalFile.name}")
@@ -155,62 +410,33 @@ object ModelDownloadCoordinator {
             if (!finalFile.exists()) {
                 downloadOneFile(remote, partFile, finalFile) { currentBytes ->
                     val downloadPercent = if (totalBytes > 0L) {
-                        (((completedBytes + currentBytes) * DOWNLOAD_PHASE_MAX) / totalBytes)
+                        (((completedBytes + currentBytes) * 99L) / totalBytes)
                             .toInt()
-                            .coerceIn(0, DOWNLOAD_PHASE_MAX)
+                            .coerceIn(0, 99)
                     } else {
-                        ((index * DOWNLOAD_PHASE_MAX) / remoteFiles.size).coerceIn(0, DOWNLOAD_PHASE_MAX)
+                        ((index * 99) / remoteFiles.size).coerceIn(0, 99)
                     }
                     reportProgress(downloadPercent)
                 }
             }
+            completedFiles += finalFile
             completedBytes += finalFile.length()
             val fileBoundaryPercent = if (totalBytes > 0L) {
-                ((completedBytes * DOWNLOAD_PHASE_MAX) / totalBytes).toInt().coerceIn(0, DOWNLOAD_PHASE_MAX)
+                ((completedBytes * 99L) / totalBytes).toInt().coerceIn(0, 99)
             } else {
-                (((index + 1) * DOWNLOAD_PHASE_MAX) / remoteFiles.size).coerceIn(0, DOWNLOAD_PHASE_MAX)
+                (((index + 1) * 99) / remoteFiles.size).coerceIn(0, 99)
             }
             reportProgress(fileBoundaryPercent)
         }
 
+        ModelLocalStore.markComplete(context, model, completedFiles)
+        val resolved = ModelLocalStore.resolve(context, model)
+            ?: error("Downloaded model files failed completion verification")
         DiagnosticsLogger.checkpoint(
             "MODEL_STANDARD_DOWNLOAD_COMPLETE",
-            "${model.modelName} files=${remoteFiles.joinToString { it.fileName }}",
+            "${model.modelName} model=${resolved.modelPath} mmproj=${resolved.mmprojPath.orEmpty()}",
         )
-
-        var importCompleted = false
-        val localInput = ModelPullInput(
-            model_name = model.modelName,
-            hub = HubSource.LOCALFS,
-            local_path = stagingDir.canonicalPath,
-        )
-        ModelManagerWrapper.pullFlow(localInput).collect { event ->
-            when (event) {
-                is ModelManagerWrapper.PullEvent.Progress -> {
-                    val total = event.files.sumOf { if (it.total_bytes > 0L) it.total_bytes else 0L }
-                    val done = event.files.sumOf { it.downloaded_bytes.coerceAtLeast(0L) }
-                    val localPercent = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
-                    reportProgress(
-                        DOWNLOAD_PHASE_MAX +
-                            ((localPercent * (99 - DOWNLOAD_PHASE_MAX)) / 100),
-                    )
-                }
-                is ModelManagerWrapper.PullEvent.Completed -> importCompleted = true
-                is ModelManagerWrapper.PullEvent.Error -> {
-                    throw IOException("GenieX local import failed (${event.code}): ${event.message}")
-                }
-            }
-        }
-
-        if (!importCompleted) error("GenieX local import ended without completing")
-        val paths = ModelManagerWrapper.getPaths(model.modelName)
-            ?: error("GenieX imported the model but could not resolve its paths")
-        if (!WorkingDirectoryManager.isPersistentModelPath(context, paths.model_path)) {
-            error("Imported model was not stored in the configured Genie/models directory")
-        }
-
         reportProgress(100)
-        deleteRecursivelyBestEffort(stagingDir)
     }
 
     private fun resolveRepositoryFiles(model: ModelData): List<String> {
@@ -303,6 +529,33 @@ object ModelDownloadCoordinator {
         finalFile: File,
         onBytes: suspend (Long) -> Unit,
     ) {
+        var lastError: IOException? = null
+        repeat(MAX_TRANSFER_ATTEMPTS) { attempt ->
+            currentCoroutineContext().ensureActive()
+            try {
+                downloadOneFileAttempt(remote, partFile, finalFile, onBytes)
+                return
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt == MAX_TRANSFER_ATTEMPTS - 1) return@repeat
+                val delayMs = RETRY_BASE_DELAY_MS * (1L shl attempt.coerceAtMost(3))
+                DiagnosticsLogger.log(
+                    "WARN",
+                    "ModelDownload",
+                    "${remote.fileName}: transient transfer error; resuming attempt ${attempt + 2}/$MAX_TRANSFER_ATTEMPTS in ${delayMs}ms: ${error.message}",
+                )
+                delay(delayMs)
+            }
+        }
+        throw lastError ?: IOException("Download failed for ${remote.fileName}")
+    }
+
+    private suspend fun downloadOneFileAttempt(
+        remote: RemoteFile,
+        partFile: File,
+        finalFile: File,
+        onBytes: suspend (Long) -> Unit,
+    ) {
         if (partFile.exists() && remote.size > 0L && partFile.length() > remote.size) {
             if (!partFile.delete()) error("Could not reset ${partFile.name}")
         }
@@ -379,6 +632,29 @@ object ModelDownloadCoordinator {
         }
     }
 
+    private fun preflightStorage(
+        root: File,
+        remote: RemoteFile,
+        finalFile: File,
+        partFile: File,
+    ) {
+        if (remote.size <= 0L) return
+        val alreadyStaged = when {
+            finalFile.exists() && finalFile.length() == remote.size -> remote.size
+            partFile.exists() -> partFile.length().coerceAtMost(remote.size)
+            else -> 0L
+        }
+        val remainingDownload = (remote.size - alreadyStaged).coerceAtLeast(0L)
+        val requiredAdditional = remainingDownload + STORAGE_HEADROOM_BYTES
+        val usable = root.usableSpace
+        if (usable > 0L && usable < requiredAdditional) {
+            throw IOException(
+                "Not enough free storage. Need about ${formatGiB(requiredAdditional)}, " +
+                    "but only ${formatGiB(usable)} is available.",
+            )
+        }
+    }
+
     private fun preflightStorage(root: File, stagingDir: File, remoteFiles: List<RemoteFile>) {
         if (remoteFiles.any { it.size <= 0L }) return
         val total = remoteFiles.sumOf { it.size }
@@ -392,9 +668,10 @@ object ModelDownloadCoordinator {
             }
         }
         val remainingDownload = (total - alreadyStaged).coerceAtLeast(0L)
-        // LOCALFS currently copies imported files into GenieX's cache. Account
-        // for the remaining download plus one complete cache copy and headroom.
-        val requiredAdditional = remainingDownload + total + STORAGE_HEADROOM_BYTES
+        // Standard downloads are already written to their final persistent
+        // location, so only the remaining bytes plus modest filesystem headroom
+        // are required. This avoids the previous double-storage requirement.
+        val requiredAdditional = remainingDownload + STORAGE_HEADROOM_BYTES
         val usable = root.usableSpace
         if (usable > 0L && usable < requiredAdditional) {
             throw IOException(
@@ -471,13 +748,13 @@ object ModelDownloadCoordinator {
                 val location = connection.getHeaderField("Location")
                 connection.disconnect()
                 if (location.isNullOrBlank()) throw IOException("HTTP $code redirect without Location")
-                if (redirectCount >= MAX_REDIRECTS) throw IOException("Too many redirects downloading from Hugging Face")
+                if (redirectCount >= MAX_REDIRECTS) throw IOException("Too many redirects downloading model asset")
                 url = URL(url, location)
             } else {
                 return connection
             }
         }
-        throw IOException("Too many redirects downloading from Hugging Face")
+        throw IOException("Too many redirects downloading model asset")
     }
 
     private fun huggingFaceApiUrl(repo: String): URL =
@@ -514,23 +791,44 @@ object ModelDownloadCoordinator {
     }
 
 
-    private fun stagingDirectoryName(model: ModelData): String =
-        safeDirectoryName(listOfNotNull(model.id, model.quant?.takeIf { it.isNotBlank() }).joinToString("-"))
+    private fun migrateLegacyV20Download(tempRoot: File, destinationDir: File, model: ModelData) {
+        val legacyDir = File(File(tempRoot, "huggingface"), ModelLocalStore.directoryName(model))
+        if (!legacyDir.isDirectory) return
 
-    private fun safeDirectoryName(value: String): String =
-        value.replace(Regex("[^A-Za-z0-9._-]+"), "_").take(120).ifBlank { "model" }
-
-    private fun cleanupStaleDownloads(stagingRoot: File, current: File) {
-        val cutoff = System.currentTimeMillis() - STALE_STAGING_AGE_MS
-        stagingRoot.listFiles()?.forEach { child ->
-            if (child != current && child.isDirectory && child.lastModified() < cutoff) {
-                deleteRecursivelyBestEffort(child)
+        var movedAny = false
+        legacyDir.listFiles()?.forEach { source ->
+            if (!source.isFile || (!source.name.endsWith(".gguf", true) && !source.name.endsWith(".part", true))) {
+                return@forEach
             }
+            val target = File(destinationDir, source.name)
+            if (target.exists()) return@forEach
+            val moved = runCatching { source.renameTo(target) }.getOrDefault(false)
+            if (!moved) {
+                runCatching {
+                    source.inputStream().buffered(IO_BUFFER_SIZE).use { input ->
+                        target.outputStream().buffered(IO_BUFFER_SIZE).use { output -> input.copyTo(output, IO_BUFFER_SIZE) }
+                    }
+                    if (target.length() == source.length()) source.delete()
+                }.getOrElse { target.delete() }
+            }
+            movedAny = movedAny || target.exists()
+        }
+
+        if (movedAny) {
+            DiagnosticsLogger.checkpoint("MODEL_V20_DOWNLOAD_MIGRATED", model.modelName)
         }
     }
 
-    private fun deleteRecursivelyBestEffort(file: File) {
-        runCatching { file.deleteRecursively() }
+    private fun cleanupStalePartialDownloads(localRoot: File, current: File) {
+        val cutoff = System.currentTimeMillis() - STALE_STAGING_AGE_MS
+        localRoot.listFiles()?.forEach { child ->
+            if (child == current || !child.isDirectory) return@forEach
+            // Completed models are user data and are never auto-deleted. Only
+            // abandoned resumable .part files are eligible for stale cleanup.
+            child.listFiles()
+                ?.filter { it.isFile && it.name.endsWith(".part") && it.lastModified() < cutoff }
+                ?.forEach { runCatching { it.delete() } }
+        }
     }
 
     private fun formatGiB(bytes: Long): String = String.format(Locale.US, "%.1f GiB", bytes / 1073741824.0)
@@ -541,17 +839,31 @@ object ModelDownloadCoordinator {
         val size: Long,
     )
 
-    private const val DOWNLOAD_PHASE_MAX = 90
+    private data class QualcommMobileTarget(
+        val displayName: String,
+        val assetKeys: List<String>,
+    )
+
+    private data class QualcommQairtAsset(
+        val chipsetKey: String,
+        val downloadUrl: URL,
+        val qairtVersion: String?,
+        val releaseVersion: String?,
+    )
+
     private const val IO_BUFFER_SIZE = 256 * 1024
     private const val CONNECT_TIMEOUT_MS = 20_000
     private const val READ_TIMEOUT_MS = 60_000
     private const val MAX_REDIRECTS = 8
+    private const val MAX_TRANSFER_ATTEMPTS = 5
+    private const val RETRY_BASE_DELAY_MS = 1_000L
     private const val PROGRESS_INTERVAL_NANOS = 250_000_000L
     private const val STORAGE_HEADROOM_BYTES = 256L * 1024L * 1024L
     private const val STALE_STAGING_AGE_MS = 7L * 24L * 60L * 60L * 1000L
     private const val MAX_METADATA_BYTES = 4L * 1024L * 1024L
     private const val MAX_METADATA_CHARS = 4 * 1024 * 1024
     private const val HTTP_RANGE_NOT_SATISFIABLE = 416
-    private const val USER_AGENT = "GenieX-Android-StandardDownloader/1.0"
+    private const val USER_AGENT = "GenieX-Android-StandardDownloader/2.0"
+    private const val QUALCOMM_HF_QAIRT = "QUALCOMM_HF_QAIRT"
     private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
 }

@@ -11,14 +11,9 @@ import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -49,7 +44,6 @@ import androidx.fragment.app.FragmentActivity
 import androidx.recyclerview.widget.RecyclerView
 import com.geniex.demo.bean.ModelData
 import com.geniex.demo.bean.getSupportPluginIds
-import com.geniex.demo.bean.isNpuModel
 import com.geniex.demo.databinding.ActivityMainBinding
 import com.geniex.demo.databinding.DialogSelectPluginIdBinding
 import com.geniex.demo.listeners.CustomDialogInterface
@@ -58,6 +52,8 @@ import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.documents.DocumentProcessor
 import com.geniex.demo.model.AppPreferences
 import com.geniex.demo.model.ModelDownloadCoordinator
+import com.geniex.demo.model.ModelDownloadService
+import com.geniex.demo.model.ModelPathResolver
 import com.geniex.demo.model.ModelManagementActivity
 import com.geniex.demo.server.InferenceBridge
 import com.geniex.demo.server.LocalApiService
@@ -71,7 +67,6 @@ import com.geniex.demo.utils.ImgUtil
 import com.geniex.demo.utils.inflate
 import com.geniex.sdk.GenieXSdk
 import com.geniex.sdk.LlmWrapper
-import com.geniex.sdk.ModelManagerWrapper
 import com.geniex.sdk.VlmWrapper
 import com.geniex.sdk.bean.ChatMessage
 import com.geniex.sdk.bean.ComputeUnitValue
@@ -83,27 +78,21 @@ import com.geniex.sdk.bean.VlmContent
 import com.geniex.sdk.bean.VlmCreateInput
 import com.gyf.immersionbar.ktx.immersionBar
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.Json
 import java.io.File
-import java.io.FileNotFoundException
-import java.io.FileOutputStream
 import java.util.Locale
 
 class MainActivity : FragmentActivity() {
     private val binding: ActivityMainBinding by inflate()
-    private var downloadJob: Job? = null
     private var modelLoadJob: Job? = null
     private var documentJob: Job? = null
-    private var downloadingModelData: ModelData? = null
     private lateinit var llDownloading: LinearLayout
     private lateinit var tvDownloadProgress: TextView
     private lateinit var pbDownloading: ProgressBar
@@ -195,6 +184,7 @@ class MainActivity : FragmentActivity() {
         initView()
         uiReady = true
         setListeners()
+        observeModelDownload()
         initGenieXSdk()
         showInterruptedLoadWarning()
         if (sdkReady) {
@@ -547,13 +537,9 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    /**
-     * Checks the Rust model manager's cache for [modelData]. Uses
-     * `getPaths`, which canonicalises the name (so `ai-hub-models/<repo>`
-     * and `qualcomm/<repo>` map to the same on-disk entry) and returns
-     * null while the pull is still in `.inflight/`.
-     */
-    private suspend fun isModelDownloaded(modelData: ModelData): Boolean = ModelManagerWrapper.getPaths(modelData.modelName) != null
+    /** Checks SDK-managed models plus persistent direct-download GGUF files. */
+    private suspend fun isModelDownloaded(modelData: ModelData): Boolean =
+        ModelPathResolver.isAvailable(this, modelData)
 
     private fun maybeResumePendingModelLoad() {
         if (!sdkReady || !uiReady || pendingResumeAttempted) return
@@ -633,7 +619,7 @@ class MainActivity : FragmentActivity() {
             DiagnosticsLogger.modelLoadStage("RESET_LOAD_STATE_COMPLETE")
 
             DiagnosticsLogger.modelLoadStage("PATH_RESOLUTION_BEGIN", "model=${selectModelData.modelName}")
-            val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)
+            val paths = ModelPathResolver.resolve(this@MainActivity, selectModelData)
             if (paths == null) {
                 DiagnosticsLogger.modelLoadStage("PATH_RESOLUTION_FAILED", "model=${selectModelData.modelName}")
                 onLoadModelFailed("model paths unavailable — pull it first")
@@ -657,7 +643,15 @@ class MainActivity : FragmentActivity() {
                 (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it)
             }
             val availableBytes = memoryInfo.availMem
-            val modelBytes = recursiveSizeBytes(File(paths.model_path))
+            val modelPathFile = File(paths.model_path)
+            val modelSizeRoot = if (
+                paths.runtime_id.equals("qairt", ignoreCase = true) && modelPathFile.isFile
+            ) {
+                modelPathFile.parentFile ?: modelPathFile
+            } else {
+                modelPathFile
+            }
+            val modelBytes = recursiveSizeBytes(modelSizeRoot)
             DiagnosticsLogger.log(
                 "INFO",
                 "Memory",
@@ -751,7 +745,7 @@ class MainActivity : FragmentActivity() {
                     val llamaTuning = if (isQairt) null else PerformanceTuning.llamaConfig(availableBytes, requestedCompute)
                     val conf =
                         if (isQairt) {
-                            ModelConfig(nCtx = 0, nGpuLayers = 0, enable_thinking = enableThinking)
+                            ModelConfig(nCtx = 0, nGpuLayers = 0)
                         } else {
                             ModelConfig(
                                 nCtx = llamaTuning!!.nCtx,
@@ -759,7 +753,6 @@ class MainActivity : FragmentActivity() {
                                 nBatch = llamaTuning.nBatch,
                                 nUBatch = llamaTuning.nUBatch,
                                 nGpuLayers = nGpuLayers,
-                                enable_thinking = enableThinking,
                             )
                         }
                     DiagnosticsLogger.modelLoadStage(
@@ -776,7 +769,6 @@ class MainActivity : FragmentActivity() {
                     val builder = LlmWrapper.builder()
                     DiagnosticsLogger.modelLoadStage("LLM_BUILDER_CREATE_COMPLETE")
                     val createInput = LlmCreateInput(
-                        model_name = paths.model_name,
                         model_path = paths.model_path,
                         tokenizer_path = paths.tokenizer_path,
                         config = conf,
@@ -828,7 +820,7 @@ class MainActivity : FragmentActivity() {
                     val config =
                         if (isNpuVlm) {
                             // QAIRT rejects non-zero n_ctx / n_gpu_layers for VLM too.
-                            ModelConfig(nCtx = 0, nGpuLayers = 0, nThreads = 8, enable_thinking = enableThinking)
+                            ModelConfig(nCtx = 0, nGpuLayers = 0, nThreads = 8)
                         } else {
                             ModelConfig(
                                 // One image costs tokenCount tokens (576 on
@@ -843,7 +835,6 @@ class MainActivity : FragmentActivity() {
                                 nBatch = 1,
                                 nUBatch = 1,
                                 nGpuLayers = nGpuLayers,
-                                enable_thinking = enableThinking,
                             )
                         }
                     DiagnosticsLogger.modelLoadStage(
@@ -856,7 +847,6 @@ class MainActivity : FragmentActivity() {
                     val builder = VlmWrapper.builder()
                     DiagnosticsLogger.modelLoadStage("VLM_BUILDER_CREATE_COMPLETE")
                     val createInput = VlmCreateInput(
-                        model_name = paths.model_name,
                         model_path = paths.model_path,
                         mmproj_path = paths.mmproj_path,
                         config = config,
@@ -907,13 +897,18 @@ class MainActivity : FragmentActivity() {
             Toast.makeText(this@MainActivity, "unload the current model first", Toast.LENGTH_SHORT).show()
             return
         }
-        if (downloadJob?.isActive == true) {
+        val active = ModelDownloadService.currentState()
+        if (active.isRunning) {
             Toast
                 .makeText(
                     this@MainActivity,
-                    "${downloadingModelData?.displayName ?: "a model"} is already downloading",
+                    "${active.displayName ?: "A model"} is already downloading in the background",
                     Toast.LENGTH_SHORT,
                 ).show()
+            return
+        }
+        ModelDownloadCoordinator.compatibilityError(selectModelData)?.let { message ->
+            Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
             return
         }
         if (ModelDownloadCoordinator.isAiHub(selectModelData) && selectModelData.chipset.isNullOrBlank()) {
@@ -925,90 +920,42 @@ class MainActivity : FragmentActivity() {
             return
         }
 
-        downloadingModelData = selectModelData
         llDownloading.visibility = View.VISIBLE
         tvDownloadProgress.text = "0%"
-        DiagnosticsLogger.checkpoint(
-            "MODEL_DOWNLOAD_BEGIN",
-            "${selectModelData.modelName}:${selectModelData.quant.orEmpty()}",
-        )
+        pbDownloading.progress = 0
+        ModelDownloadService.start(this, selectModelData)
+    }
 
-        val wakeLock =
-            (getSystemService(Context.POWER_SERVICE) as PowerManager)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "geniex:model_download")
-        wakeLock.acquire(DOWNLOAD_WAKELOCK_TIMEOUT_MS)
-        val newDownloadJob = modelScope.launch(start = CoroutineStart.LAZY) {
-            val thisJob = coroutineContext[Job]
-            try {
-                    if (isModelDownloaded(selectModelData)) {
-                        runOnUiThread {
+    private fun observeModelDownload() {
+        modelScope.launch {
+            ModelDownloadService.state.collect { download ->
+                runOnUiThread {
+                    if (isFinishing || isDestroyed || !::llDownloading.isInitialized) return@runOnUiThread
+                    when (download.status) {
+                        ModelDownloadService.Status.RUNNING -> {
+                            llDownloading.visibility = View.VISIBLE
+                            tvDownloadProgress.text = "${download.percent}%"
+                            pbDownloading.progress = download.percent
+                        }
+                        ModelDownloadService.Status.COMPLETED -> {
+                            tvDownloadProgress.text = "100%"
+                            pbDownloading.progress = 100
                             llDownloading.visibility = View.GONE
-                            Toast.makeText(this@MainActivity, "model already downloaded", Toast.LENGTH_SHORT).show()
+                            refreshSelectedModelUi()
                         }
-                        return@launch
-                    }
-
-                    ModelDownloadCoordinator.downloadFlow(this@MainActivity, selectModelData).collect { event ->
-                        when (event) {
-                            is ModelDownloadCoordinator.Event.Progress -> {
-                                runOnUiThread { tvDownloadProgress.text = "${event.percent}%" }
-                            }
-
-                            is ModelDownloadCoordinator.Event.Completed -> {
-                                val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)
-                                val persistent = WorkingDirectoryManager.isPersistentModelPath(
-                                    this@MainActivity,
-                                    paths?.model_path,
-                                )
-                                DiagnosticsLogger.checkpoint(
-                                    "MODEL_DOWNLOAD_COMPLETE",
-                                    "${selectModelData.modelName} path=${paths?.model_path.orEmpty()} persistent=$persistent",
-                                )
-                                runOnUiThread {
-                                    llDownloading.visibility = View.GONE
-                                    tvDownloadProgress.text = "100%"
-                                    Toast
-                                        .makeText(
-                                            this@MainActivity,
-                                            if (persistent) {
-                                                "${selectModelData.displayName} downloaded to Genie/models"
-                                            } else {
-                                                "Download finished, but model storage verification failed"
-                                            },
-                                            if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
-                                        ).show()
-                                }
-                            }
-
-                            is ModelDownloadCoordinator.Event.Error -> {
-                                Log.e(
-                                    TAG,
-                                    "model download failed code=${event.code ?: "http"}: ${event.message}",
-                                )
-                                runOnUiThread {
-                                    llDownloading.visibility = View.GONE
-                                    Toast
-                                        .makeText(
-                                            this@MainActivity,
-                                            "Download failed: ${event.message}",
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                }
-                            }
+                        ModelDownloadService.Status.FAILED -> {
+                            llDownloading.visibility = View.GONE
+                            refreshSelectedModelUi()
                         }
+                        ModelDownloadService.Status.CANCELLED -> {
+                            llDownloading.visibility = View.GONE
+                            tvDownloadProgress.text = "0%"
+                        }
+                        ModelDownloadService.Status.IDLE -> Unit
                     }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } finally {
-                if (wakeLock.isHeld) wakeLock.release()
-                if (downloadJob === thisJob) {
-                    downloadingModelData = null
-                    downloadJob = null
                 }
             }
         }
-        downloadJob = newDownloadJob
-        newDownloadJob.start()
     }
 
     private fun showAppMenu(anchor: View) {
@@ -1061,38 +1008,30 @@ class MainActivity : FragmentActivity() {
             clearHistory()
         }
         /*
-         * Step 3. download model. Cancelling the coroutine closes the active
-         * HTTP/native pull. Standard Hugging Face downloads keep their .part
-         * file so Retry can resume with an HTTP Range request.
+         * Step 3. download model. ModelDownloadService owns the transfer, so
+         * backgrounding or destroying this Activity does not cancel it. Cancel
+         * stops the service job; Retry starts it again and resumes any .part file.
          */
         binding.btnCancelDownload.setOnClickListener {
-            downloadJob?.cancel()
+            ModelDownloadService.cancel(this@MainActivity)
             tvDownloadProgress.text = "0%"
             binding.llDownloading.visibility = View.GONE
         }
         binding.btnRetryDownload.setOnClickListener {
-            val retryModel = downloadingModelData ?: return@setOnClickListener
-            val previousJob = downloadJob
-            if (previousJob == null || !previousJob.isActive) {
-                downloadModel(retryModel)
-            } else {
-                previousJob.invokeOnCompletion {
-                    if (!isFinishing && !isDestroyed) {
-                        runOnUiThread { downloadModel(retryModel) }
-                    }
-                }
-                previousJob.cancel()
-            }
+            val failedId = ModelDownloadService.currentState().modelId ?: selectModelId
+            val retryModel = modelList.firstOrNull { it.id == failedId } ?: return@setOnClickListener
+            if (!ModelDownloadService.currentState().isRunning) downloadModel(retryModel)
         }
         btnDownload.setOnClickListener {
-            if (downloadJob?.isActive == true) {
-                if (downloadingModelData?.id == selectModelId) {
+            val activeDownload = ModelDownloadService.currentState()
+            if (activeDownload.isRunning) {
+                if (activeDownload.modelId == selectModelId) {
                     binding.llDownloading.visibility = View.VISIBLE
                 } else {
                     Toast
                         .makeText(
                             this@MainActivity,
-                            "${downloadingModelData?.displayName} is currently downloading.",
+                            "${activeDownload.displayName ?: "A model"} is currently downloading in the background.",
                             Toast.LENGTH_SHORT,
                         ).show()
                 }
@@ -1198,7 +1137,7 @@ class MainActivity : FragmentActivity() {
             modelScope.launch {
                 try {
                     val selectModelData = modelList.first { it.id == selectModelId }
-                    val isNpu = ModelManagerWrapper.getPaths(selectModelData.modelName)?.runtime_id == "qairt"
+                    val isNpu = ModelPathResolver.resolve(this@MainActivity, selectModelData)?.runtime_id == "qairt"
                     Log.d(TAG, "isNpu: $isNpu")
 
                     val sb = StringBuilder()
@@ -2073,14 +2012,14 @@ class MainActivity : FragmentActivity() {
 
     override fun onDestroy() {
         popupWindow?.dismiss()
-        downloadJob?.cancel()
+        // Model downloads belong to the foreground service and intentionally
+        // outlive this Activity. Only model-loading/inference work is cancelled.
         modelLoadJob?.cancel()
         modelScope.cancel()
         super.onDestroy()
     }
 
     companion object {
-        private const val DOWNLOAD_WAKELOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L
         private const val REQUEST_TEXT_TRANSCRIPTS = 3001
         private const val REQUEST_MODEL_MANAGEMENT = 3002
         private const val MENU_MANAGE_MODELS = 4101

@@ -63,11 +63,15 @@ recovery-safe: a stale or invalid saved path will return to the setup screen
 instead of crash-looping the application.
 
 
-Model downloads are verified after completion by resolving the path reported by `ModelManagerWrapper.getPaths()`. If the SDK ever reports a path outside `Genie/models/`, the app records that path in diagnostics and shows a storage-verification warning rather than silently implying the download is persistent.
+SDK-managed downloads are still resolved through `ModelManagerWrapper.getPaths()`. Public Hugging Face GGUF entries use their verified files directly from the persistent shared workspace. Selected Qualcomm models that publish a verified `GENIEX_QAIRT` mobile bundle on Qualcomm's Hugging Face account now use a separate direct QAIRT path; older AI Hub/QAIRT entries remain managed by the GenieX model manager.
 
 ### Hugging Face download path
 
-Public Hugging Face GGUF entries use ordinary resumable HTTPS downloads rather than GenieX's native Hugging Face pull implementation. Files are staged under `Genie/temp/huggingface/`, resumed with HTTP `Range` when a `.part` file exists, and then imported into the persistent GenieX cache through `HubSource.LOCALFS`. VLM entries download the matching model GGUF plus an `mmproj` GGUF. Qualcomm AI Hub/QAIRT entries still use the native GenieX model-manager pull path.
+Public Hugging Face GGUF entries use ordinary resumable HTTPS downloads rather than GenieX's native Hugging Face pull implementation. Files stream directly into `Genie/models/local/<model>/` through `.part` files and are atomically renamed when complete, so there is no second multi-gigabyte cache copy and no `LOCALFS` registration step. VLM entries download the matching model GGUF plus an `mmproj` GGUF. A completion marker records the exact expected files, and split-GGUF models are not considered usable until every shard is present.
+
+For catalog entries marked `QUALCOMM_HF_QAIRT`, the app fetches Qualcomm's small Hugging Face `release_assets.json`, selects `geniex_qairt` + W4A16 for the detected SM8750/SM8850 target, downloads the advertised Qualcomm package with the same resumable foreground service, safely extracts it into `Genie/models/qualcomm-qairt/<model>/bundle/`, verifies `metadata.json` plus compiled `.bin` files, and loads that persistent bundle directly with the QAIRT runtime. The ZIP is deleted only after a verified extraction; the extracted model remains until the user explicitly deletes it in the Models screen. Other AI Hub/QAIRT entries continue to use the native GenieX model-manager pull path.
+
+Model downloads run in an Android `dataSync` foreground service with a partial CPU wake lock. Leaving the app, locking the screen, or removing the UI task does not make an Activity own/cancel the transfer. The notification reports progress and exposes Cancel. Transient transfer failures are retried and resumed from the existing `.part` file. A force-stop by the user or OS-level app disable still stops the process; the next explicit retry resumes any valid partial download.
 
 ## v15 web authentication and context management
 

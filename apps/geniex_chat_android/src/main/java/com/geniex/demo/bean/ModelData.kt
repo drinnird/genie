@@ -20,6 +20,9 @@ data class ModelData(
     val aiHubDisplayName: String? = null,
     val chipset: String? = null,
     val minAvailableMemoryGiB: Double? = null,
+    val downloadSource: String? = null,
+    val qualcommHfRepo: String? = null,
+    val qualcommPrecision: String? = null,
 ) {
     val isQ4Quant: Boolean
         get() = quant?.startsWith("Q4", ignoreCase = true) == true
