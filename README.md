@@ -84,13 +84,3 @@ The custom Android and browser chat UIs support multiple `.txt` lecture transcri
 ### Compact chat navigation
 
 The chat header shows the selected model and active compute backend. Use the gear button in the top-right for Models, Web server, and Diagnostics. Downloaded model cards expose **Load** rather than **Download**; the active model exposes **Unload**.
-
-## Remembered model and automatic switching (v22.5)
-
-GenieX remembers the last model that **successfully completed native loading**, together with its CPU/GPU/NPU compute choice, and restores it automatically on the next normal launch. Merely browsing or selecting another catalog row does not overwrite this remembered model. A previously interrupted native model load is not auto-restored on that launch, preventing a crash loop.
-
-When another downloaded model is selected, the Models screen now shows **Switch**. GenieX safely unloads the current native wrapper first, then uses its existing clean-runtime restart hand-off to load the requested replacement automatically. This avoids keeping two large model runtimes resident at once while preserving the native-memory safety behavior used for GPU/NPU/QAIRT switching. If the local API server was running, it is resumed after the replacement model loads.
-
-## v22.6 compile correction
-
-The VLM chat-role guard now accounts for GenieX 0.4.0 exposing `VlmChatMessage.role` as nullable. Null roles are treated as invalid and repaired before native template processing, while the role-policy APIs continue to operate on non-null strings.

@@ -151,7 +151,7 @@ class MainActivity : FragmentActivity() {
     @Volatile private var sdkReady = false
     private var uiReady = false
     @Volatile private var nativeRuntimeWasUsed = false
-    private var startupModelRestoreAttempted = false
+    private var pendingResumeAttempted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -177,7 +177,7 @@ class MainActivity : FragmentActivity() {
         initGenieXSdk()
         showInterruptedLoadWarning()
         if (sdkReady) {
-            maybeRestoreStartupModel()
+            maybeResumePendingModelLoad()
         }
     }
 
@@ -278,7 +278,7 @@ class MainActivity : FragmentActivity() {
         refreshServerStatusUi()
 
         findViewById<View>(R.id.v_tip).setOnClickListener {
-            Toast.makeText(this, "Model operation in progress…", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "please unload model first", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -319,13 +319,13 @@ class MainActivity : FragmentActivity() {
                 // These controls are hidden compatibility actions now; the Models
                 // screen is the visible load/unload surface.
                 btnLoadModel.visibility = View.GONE
-                btnLoadModel.isEnabled = available
+                btnLoadModel.isEnabled = available && !anyModelLoaded
                 btnLoadModel.text = if (available) "Load model" else "Download in Models"
                 btnUnloadModel.visibility = View.GONE
                 btnStop.visibility = if (anyModelLoaded && isGenerating) View.VISIBLE else View.GONE
                 tvSelectedModelStatus.text = when {
                     active -> "Active • ${InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary}"
-                    anyModelLoaded -> "Ready to switch • ${model.computeSummary}"
+                    anyModelLoaded -> "Not active • unload the active model to switch"
                     available -> "Ready to load • ${model.computeSummary}"
                     else -> "Not downloaded • ${model.computeSummary}"
                 }
@@ -385,7 +385,7 @@ class MainActivity : FragmentActivity() {
                         // left in the workspace by a previous installation.
                         if (uiReady) {
                             refreshSelectedModelUi()
-                            maybeRestoreStartupModel()
+                            maybeResumePendingModelLoad()
                         }
                     }
                 }
@@ -483,125 +483,43 @@ class MainActivity : FragmentActivity() {
     private suspend fun isModelDownloaded(modelData: ModelData): Boolean =
         ModelPathResolver.isAvailable(this, modelData)
 
-    private fun maybeRestoreStartupModel() {
-        if (!sdkReady || !uiReady || startupModelRestoreAttempted || hasLoadedModel()) return
-
-        // A prior process death during native creation may indicate an incompatible
-        // or too-large model. Do not auto-enter a crash loop; let the warning be
-        // acknowledged and require an explicit load for this session.
+    private fun maybeResumePendingModelLoad() {
+        if (!sdkReady || !uiReady || pendingResumeAttempted) return
         if (DiagnosticsLogger.wasModelLoadInterrupted()) {
             AppPreferences.clearPendingModelLoad(this)
-            startupModelRestoreAttempted = true
             return
         }
-
-        val pending = AppPreferences.getPendingModelLoad(this)
-        val remembered = AppPreferences.getLastLoadedModel(this) ?: migrateLegacyLastLoadedModel()
-        val requestedModelId = pending?.modelId ?: remembered?.modelId ?: return
-        val requestedCompute = pending?.computeUnit ?: remembered?.computeUnit ?: return
-        startupModelRestoreAttempted = true
-        if (pending != null) AppPreferences.clearPendingModelLoad(this)
-
-        val model = modelList.firstOrNull { it.id == requestedModelId }
-        if (model == null) {
-            DiagnosticsLogger.log(
-                "WARN",
-                TAG,
-                "startup model restore skipped; catalog entry missing id=$requestedModelId",
-            )
-            return
-        }
-        val computeUnit = preferredSupportedCompute(model, requestedCompute)
+        val pending = AppPreferences.getPendingModelLoad(this) ?: return
+        pendingResumeAttempted = true
+        AppPreferences.clearPendingModelLoad(this)
+        val model = modelList.firstOrNull { it.id == pending.modelId } ?: return
         AppPreferences.setSelectedModelId(this, model.id)
         syncSelectedModelFromPreferences()
         DiagnosticsLogger.checkpoint(
-            if (pending != null) "SAFE_RUNTIME_RESUME" else "STARTUP_MODEL_RESTORE",
-            "model=${model.modelName} compute=$computeUnit",
+            "SAFE_RUNTIME_RESUME",
+            "model=${model.modelName} compute=${pending.computeUnit}",
         )
-
-        // Availability can touch the SDK model manager and filesystem; never do
-        // that work on the UI thread during startup.
-        modelScope.launch {
-            if (!runCatching { isModelDownloaded(model) }.getOrDefault(false)) {
-                DiagnosticsLogger.log(
-                    "WARN",
-                    TAG,
-                    "startup model restore skipped; model is no longer available id=${model.id}",
-                )
-                runOnUiThread { refreshSelectedModelUi() }
-                return@launch
-            }
-            runOnUiThread {
-                if (isFinishing || isDestroyed || hasLoadedModel()) return@runOnUiThread
-                llLoading.visibility = View.VISIBLE
-                vTip.visibility = View.VISIBLE
-                val nGpuLayers = if (computeUnit == (ComputeUnitValue.CPU.value ?: "cpu")) 0 else -1
-                loadModel(
-                    selectModelData = model,
-                    modelDataPluginId = model.runtime ?: "llama_cpp",
-                    nGpuLayers = nGpuLayers,
-                    deviceId = computeUnit,
-                    bypassFreshRuntimeGuard = true,
-                )
-            }
-        }
-    }
-
-    /**
-     * v22.4 recorded completed native loads in diagnostics but did not yet have
-     * a dedicated startup-model preference. Recover that last known-good load
-     * once so upgrades get the new startup behavior immediately.
-     */
-    private fun migrateLegacyLastLoadedModel(): AppPreferences.LastLoadedModel? {
-        if (DiagnosticsLogger.lastModelLoadStage() != "MODEL_LOAD_COMPLETE") return null
-        val details = DiagnosticsLogger.interruptedModelDetails()
-        val fields = details.split(' ')
-            .mapNotNull { token ->
-                val separator = token.indexOf('=')
-                if (separator <= 0 || separator == token.lastIndex) null
-                else token.substring(0, separator) to token.substring(separator + 1)
-            }
-            .toMap()
-        val modelName = fields["model"] ?: return null
-        val quant = fields["quant"]
-        val rawCompute = fields["compute"] ?: return null
-        val model = modelList.firstOrNull { candidate ->
-            candidate.modelName == modelName && (quant.isNullOrBlank() || candidate.quant.orEmpty() == quant)
-        } ?: return null
-        val compute = preferredSupportedCompute(model, rawCompute)
-        AppPreferences.rememberSuccessfulModelLoad(this, model.id, compute)
-        DiagnosticsLogger.log(
-            "INFO",
-            TAG,
-            "migrated last successful model preference id=${model.id} compute=$compute",
+        llLoading.visibility = View.VISIBLE
+        vTip.visibility = View.VISIBLE
+        val nGpuLayers = if (pending.computeUnit == ComputeUnitValue.CPU.value) 0 else -1
+        loadModel(
+            selectModelData = model,
+            modelDataPluginId = model.runtime ?: "llama_cpp",
+            nGpuLayers = nGpuLayers,
+            deviceId = pending.computeUnit,
+            bypassFreshRuntimeGuard = true,
         )
-        return AppPreferences.LastLoadedModel(model.id, compute)
     }
 
-    private fun preferredSupportedCompute(model: ModelData, preferred: String): String {
-        val supported = model.getSupportPluginIds()
-        if (preferred in supported) return preferred
-        val npu = ComputeUnitValue.NPU.value ?: "npu"
-        val gpu = ComputeUnitValue.GPU.value ?: "gpu"
-        val cpu = ComputeUnitValue.CPU.value ?: "cpu"
-        return listOf(npu, gpu, cpu).firstOrNull { it in supported }
-            ?: supported.firstOrNull()
-            ?: npu
-    }
-
-    private fun restartIntoFreshRuntime(
-        selectModelData: ModelData,
-        computeUnit: String,
-        resumeServerAfterRestart: Boolean? = null,
-    ) {
+    private fun restartIntoFreshRuntime(selectModelData: ModelData, computeUnit: String) {
         AppPreferences.setPendingModelLoad(this, selectModelData.id, computeUnit)
         DiagnosticsLogger.checkpoint(
             "SAFE_RUNTIME_RESTART",
             "model=${selectModelData.modelName} compute=$computeUnit",
         )
-        val serverWasRunning = resumeServerAfterRestart ?: LocalApiServer.isRunning()
+        val serverWasRunning = LocalApiServer.isRunning()
         AppPreferences.setResumeServerAfterRestart(this, serverWasRunning)
-        if (LocalApiServer.isRunning()) LocalApiServer.stop()
+        if (serverWasRunning) LocalApiServer.stop()
         Toast.makeText(this, "Restarting the model engine for a clean switch…", Toast.LENGTH_SHORT).show()
         startActivity(
             Intent(this, RuntimeRestartActivity::class.java).apply {
@@ -618,98 +536,6 @@ class MainActivity : FragmentActivity() {
         return file.listFiles()?.sumOf { recursiveSizeBytes(it) } ?: 0L
     }
 
-    /**
-     * Switch models without asking the user to manually unload first. GenieX
-     * native/driver allocations are safest when the replacement model starts in
-     * a fresh process, so the active wrapper is destroyed first and the existing
-     * restart hand-off loads the requested model automatically.
-     */
-    private fun switchLoadedModel(
-        selectModelData: ModelData,
-        requestedCompute: String,
-    ) {
-        if (InferenceBridge.activeModelId == selectModelData.id) {
-            Toast.makeText(this, "${selectModelData.displayName} is already active.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (modelLoadJob?.isActive == true) {
-            Toast.makeText(this, "A model operation is already in progress.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (DocumentProcessor.isProcessing() || isGenerating) {
-            Toast.makeText(this, "Finish or stop the current inference before switching models.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        llLoading.visibility = View.VISIBLE
-        vTip.visibility = View.VISIBLE
-        val switchJob = modelScope.launch {
-            var serverWasRunning = false
-            try {
-                val ran = InferenceBridge.tryRunExclusive {
-                    // Once the inference lock is ours, stop the API listener so a
-                    // new request cannot acquire the model while it is being torn down.
-                    serverWasRunning = LocalApiServer.isRunning()
-                    if (serverWasRunning) LocalApiServer.stop()
-
-                    destroyLoadedModelLocked()
-                }
-                if (!ran) {
-                    runOnUiThread {
-                        llLoading.visibility = View.INVISIBLE
-                        vTip.visibility = View.GONE
-                        Toast.makeText(
-                            this@MainActivity,
-                            "The active model is busy. Try switching again when inference finishes.",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                    return@launch
-                }
-
-                DiagnosticsLogger.checkpoint(
-                    "MODEL_SWITCH_UNLOAD_COMPLETE",
-                    "next=${selectModelData.modelName} compute=$requestedCompute",
-                )
-                runOnUiThread {
-                    // Visible chat belongs to the unloaded native conversation.
-                    updateUiAfterModelUnload(showToast = false)
-                    restartIntoFreshRuntime(
-                        selectModelData,
-                        requestedCompute,
-                        resumeServerAfterRestart = serverWasRunning,
-                    )
-                }
-            } catch (error: kotlinx.coroutines.CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                DiagnosticsLogger.log("ERROR", TAG, "automatic model switch unload failed", error)
-                if (serverWasRunning && !LocalApiServer.isRunning()) {
-                    LocalApiService.start(
-                        applicationContext,
-                        AppPreferences.getServerPort(this@MainActivity),
-                        AppPreferences.isLanEnabled(this@MainActivity),
-                        AppPreferences.getApiKey(this@MainActivity),
-                    )
-                }
-                runOnUiThread {
-                    llLoading.visibility = View.INVISIBLE
-                    vTip.visibility = View.GONE
-                    Toast.makeText(
-                        this@MainActivity,
-                        error.message ?: "Could not unload the active model for switching.",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    refreshSelectedModelUi()
-                }
-            }
-        }
-        modelLoadJob = switchJob
-        switchJob.invokeOnCompletion {
-            if (modelLoadJob === switchJob) modelLoadJob = null
-        }
-    }
-
     private fun loadModel(
         selectModelData: ModelData,
         modelDataPluginId: String,
@@ -718,11 +544,7 @@ class MainActivity : FragmentActivity() {
         bypassFreshRuntimeGuard: Boolean = false,
     ) {
         val requestedCompute: String = deviceId ?: ComputeUnitValue.NPU.value ?: "npu"
-        if (hasLoadedModel()) {
-            switchLoadedModel(selectModelData, requestedCompute)
-            return
-        }
-        if (nativeRuntimeWasUsed && !bypassFreshRuntimeGuard) {
+        if (nativeRuntimeWasUsed && !bypassFreshRuntimeGuard && !hasLoadedModel()) {
             restartIntoFreshRuntime(selectModelData, requestedCompute)
             return
         }
@@ -802,10 +624,10 @@ class MainActivity : FragmentActivity() {
                         "availableBytes=$availableBytes minimumBytes=$minimumBytes reason=model_threshold",
                     )
                     onLoadModelFailed(
-                        "Load blocked because available memory is below this model's safe threshold. " +
-                            "${selectModelData.displayName} recommends ${String.format(Locale.US, "%.1f", minGiB)} GiB free, " +
-                            "but Android reports ${formatGiB(availableBytes)}. " +
-                            "Use a smaller model, close other apps, or reboot and try again.",
+                        "Load blocked to prevent another low-memory process kill. " +
+                            "${selectModelData.displayName} has a ${String.format(Locale.US, "%.1f", minGiB)} GiB " +
+                            "recommended free-memory threshold in this build, but Android reports ${formatGiB(availableBytes)}. " +
+                            "Use the GGUF Q4_0 version instead, or close apps/reboot and try again.",
                     )
                     return@launch
                 }
@@ -912,11 +734,6 @@ class MainActivity : FragmentActivity() {
                                 if (isQairt) PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS else llamaTuning!!.nCtx,
                             )
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
-                            AppPreferences.rememberSuccessfulModelLoad(
-                                this@MainActivity,
-                                selectModelData.id,
-                                requestedCompute,
-                            )
                             onLoadModelSuccess("LLM model loaded")
                         }.onFailure { error ->
                             DiagnosticsLogger.modelLoadStage(
@@ -995,11 +812,6 @@ class MainActivity : FragmentActivity() {
                                 if (isNpuVlm) PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS else vlmContextSize(vlmVisionConfig),
                             )
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
-                            AppPreferences.rememberSuccessfulModelLoad(
-                                this@MainActivity,
-                                selectModelData.id,
-                                requestedCompute,
-                            )
                             onLoadModelSuccess("VLM model loaded")
                         }.onFailure { error ->
                             DiagnosticsLogger.modelLoadStage(
@@ -1023,6 +835,10 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun downloadModel(selectModelData: ModelData) {
+        if (hasLoadedModel()) {
+            Toast.makeText(this@MainActivity, "unload the current model first", Toast.LENGTH_SHORT).show()
+            return
+        }
         val active = ModelDownloadService.currentState()
         if (active.isRunning) {
             Toast
@@ -1099,66 +915,6 @@ class MainActivity : FragmentActivity() {
                 true
             }
             show()
-        }
-    }
-
-    private fun requestModelUnload() {
-        if (!hasLoadedModel()) {
-            Toast.makeText(this, "model not loaded", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (DocumentProcessor.isProcessing() || isGenerating) {
-            Toast.makeText(this, "Finish or stop the current inference before unloading.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        modelScope.launch {
-            try {
-                val ran = InferenceBridge.tryRunExclusive { destroyLoadedModelLocked() }
-                if (!ran) {
-                    runOnUiThread {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Model became busy. Try unload again when inference finishes.",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                    return@launch
-                }
-                DiagnosticsLogger.checkpoint("MODEL_UNLOAD", "fresh process required before next model load")
-                runOnUiThread { updateUiAfterModelUnload(showToast = true) }
-            } catch (error: kotlinx.coroutines.CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                DiagnosticsLogger.log("ERROR", TAG, "model unload failed", error)
-                runOnUiThread {
-                    Toast.makeText(
-                        this@MainActivity,
-                        error.message ?: "Model unload failed",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
-            }
-        }
-    }
-
-    private fun requestModelLoad(selectModelData: ModelData) {
-        // Availability checks may query the SDK manager/filesystem. Keep them
-        // off the main thread, then enter the normal compute-picker/load path.
-        modelScope.launch {
-            if (!runCatching { isModelDownloaded(selectModelData) }.getOrDefault(false)) {
-                runOnUiThread {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Model not downloaded — open Models and download it first.",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    refreshSelectedModelUi()
-                }
-                return@launch
-            }
-            runOnUiThread {
-                if (!isFinishing && !isDestroyed) startLoadModel(selectModelData)
-            }
         }
     }
 
@@ -1240,7 +996,22 @@ class MainActivity : FragmentActivity() {
                 return@setOnClickListener
             }
             Log.d(TAG, "current select model data:$selectModelData")
-            requestModelLoad(selectModelData)
+            if (hasLoadedModel()) {
+                Toast.makeText(this@MainActivity, "please unload first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            // Availability is checked against the manager's cache — a pull
+            // that was cancelled mid-flight is not listed until it completes.
+            modelScope.launch {
+                if (!isModelDownloaded(selectModelData)) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Model not downloaded — open Models and download it first.", Toast.LENGTH_LONG).show()
+                    }
+                    return@launch
+                }
+                runOnUiThread { startLoadModel(selectModelData) }
+            }
         }
 
         /*
@@ -1326,7 +1097,6 @@ class MainActivity : FragmentActivity() {
                             val sendMsg = VlmChatMessage(role = "user", contents = contents)
                             vlmChatList.add(sendMsg)
                             trimVlmHistoryForMemory()
-                            ensureValidVlmHistoryForTemplate(sendMsg)
                             var generationCompleted = false
                             try {
                                 Log.d(TAG, "applying VLM chat template; turns=${vlmChatList.size}")
@@ -1371,7 +1141,6 @@ class MainActivity : FragmentActivity() {
                             val sendMsg = ChatMessage(role = "user", inputString)
                             chatList.add(sendMsg)
                             trimLlmHistoryForMemory()
-                            ensureValidLlmHistoryForTemplate(sendMsg)
                             var generationCompleted = false
                             try {
                                 llmWrapper
@@ -1461,7 +1230,93 @@ class MainActivity : FragmentActivity() {
         /*
          * Step 6. others
          */
-        btnUnloadModel.setOnClickListener { requestModelUnload() }
+        btnUnloadModel.setOnClickListener {
+            if (!hasLoadedModel()) {
+                Toast.makeText(this@MainActivity, "model not loaded", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            // The native model handle is shared with the HTTP server. Never
+            // destroy it while either UI, document processing, or API inference is using it.
+            if (DocumentProcessor.isProcessing()) {
+                Toast.makeText(this@MainActivity, "Transcript processing is still running.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (InferenceBridge.isBusy()) {
+                Toast.makeText(this@MainActivity, "Model is busy. Try again when inference finishes.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            // Unload model and cleanup
+            val handleUnloadResult = fun(result: Int) {
+                resetLoadState()
+                InferenceBridge.clear()
+                DiagnosticsLogger.checkpoint("MODEL_UNLOAD", "fresh process required before next model load")
+                chatList.clear()
+                vlmChatList.clear()
+                runOnUiThread {
+                    vTip.visibility = View.GONE
+                    btnUnloadModel.visibility = View.GONE
+                    btnStop.visibility = View.GONE
+                    btnAddImage.visibility = View.GONE
+                    messages.clear()
+                    clearImages()
+                    reloadRecycleView()
+                    Toast
+                        .makeText(
+                            this@MainActivity,
+                            if (result == 0) {
+                                "unload success"
+                            } else {
+                                "unload failed and error code: $result"
+                            },
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    refreshSendButtonState()
+                    refreshSelectedModelUi()
+                    refreshServerStatusUi()
+                }
+            }
+            modelScope.launch {
+                try {
+                    val ran = InferenceBridge.tryRunExclusive {
+                        if (isLoadVlmModel) {
+                            vlmWrapper.stopStream()
+                            vlmWrapper.destroy()
+                            vlmChatList.clear()
+                            settleAfterNativeUnload()
+                            handleUnloadResult(0)
+                        } else if (isLoadLlmModel) {
+                            llmWrapper.stopStream()
+                            llmWrapper.destroy()
+                            chatList.clear()
+                            settleAfterNativeUnload()
+                            handleUnloadResult(0)
+                        } else {
+                            handleUnloadResult(0)
+                        }
+                    }
+                    if (!ran) {
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Model became busy. Try unload again when inference finishes.",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    DiagnosticsLogger.log("ERROR", TAG, "model unload failed", error)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            error.message ?: "Model unload failed",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            }
+        }
         btnStop.setOnClickListener {
             documentStopRequested = true
             documentJob?.cancel()
@@ -1494,39 +1349,6 @@ class MainActivity : FragmentActivity() {
 
     private fun formatGiB(bytes: Long): String =
         String.format(Locale.US, "%.2f GiB", bytes.toDouble() / GIB_BYTES.toDouble())
-
-    /** Must be called while [InferenceBridge] exclusive ownership is held. */
-    private suspend fun destroyLoadedModelLocked() {
-        when {
-            isLoadVlmModel -> {
-                vlmWrapper.stopStream()
-                vlmWrapper.destroy()
-            }
-            isLoadLlmModel -> {
-                llmWrapper.stopStream()
-                llmWrapper.destroy()
-            }
-        }
-        resetLoadState()
-        InferenceBridge.clear()
-        chatList.clear()
-        vlmChatList.clear()
-        settleAfterNativeUnload()
-    }
-
-    private fun updateUiAfterModelUnload(showToast: Boolean) {
-        vTip.visibility = View.GONE
-        btnUnloadModel.visibility = View.GONE
-        btnStop.visibility = View.GONE
-        btnAddImage.visibility = View.GONE
-        messages.clear()
-        clearImages()
-        reloadRecycleView()
-        if (showToast) Toast.makeText(this, "Model unloaded", Toast.LENGTH_SHORT).show()
-        refreshSendButtonState()
-        refreshSelectedModelUi()
-        refreshServerStatusUi()
-    }
 
     private suspend fun settleAfterNativeUnload() {
         // GenieX may release large native / driver allocations asynchronously.
@@ -1705,16 +1527,12 @@ class MainActivity : FragmentActivity() {
                 .coerceAtLeast(PerformanceTuning.MIN_RESPONSE_TOKENS) * 2)
         val charLimit = minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
         var totalChars = chatList.sumOf { it.content.length }
-
-        // Remove complete oldest turns. Removing a user message without its
-        // paired assistant reply can produce assistant->user history, and some
-        // native Jinja templates abort the process on that invalid role order.
         while (chatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES || totalChars > charLimit) {
-            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(chatList.map { it.role })
-            if (removeCount == 0) break
-            repeat(removeCount) {
-                totalChars -= chatList.removeAt(0).content.length
-            }
+            // Preserve the latest user turn even when it alone is very long. The
+            // context-budget check after chat templating will then show a clear
+            // message instead of silently deleting the user's prompt.
+            if (chatList.size <= 1) break
+            totalChars -= chatList.removeAt(0).content.length
         }
     }
 
@@ -1730,34 +1548,9 @@ class MainActivity : FragmentActivity() {
         val charLimit = minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
         var totalChars = vlmChatList.sumOf(::messageChars)
         while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES || totalChars > charLimit) {
-            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(vlmChatList.map { it.role.orEmpty() })
-            if (removeCount == 0) break
-            repeat(removeCount) {
-                totalChars -= messageChars(vlmChatList.removeAt(0))
-            }
+            if (vlmChatList.size <= 1) break
+            totalChars -= messageChars(vlmChatList.removeAt(0))
         }
-    }
-
-    private fun ensureValidLlmHistoryForTemplate(currentUser: ChatMessage) {
-        val roleError = ChatRolePolicy.validateForGeneration(chatList.map { it.role }) ?: return
-        DiagnosticsLogger.log(
-            "WARN",
-            TAG,
-            "repairing invalid LLM role history before native template: $roleError roles=${chatList.map { it.role }}",
-        )
-        chatList.clear()
-        chatList.add(currentUser)
-    }
-
-    private fun ensureValidVlmHistoryForTemplate(currentUser: VlmChatMessage) {
-        val roleError = ChatRolePolicy.validateForGeneration(vlmChatList.map { it.role.orEmpty() }) ?: return
-        DiagnosticsLogger.log(
-            "WARN",
-            TAG,
-            "repairing invalid VLM role history before native template: $roleError roles=${vlmChatList.map { it.role }}",
-        )
-        vlmChatList.clear()
-        vlmChatList.add(currentUser)
     }
 
     private fun openGallery() {
@@ -1782,11 +1575,8 @@ class MainActivity : FragmentActivity() {
                 syncSelectedModelFromPreferences()
                 refreshSelectedModelUi()
                 when (action) {
-                    ModelManagementActivity.ACTION_LOAD -> {
-                        val selectedModel = modelList.firstOrNull { it.id == modelId }
-                        if (selectedModel != null) requestModelLoad(selectedModel)
-                    }
-                    ModelManagementActivity.ACTION_UNLOAD -> requestModelUnload()
+                    ModelManagementActivity.ACTION_LOAD -> btnLoadModel.performClick()
+                    ModelManagementActivity.ACTION_UNLOAD -> btnUnloadModel.performClick()
                 }
             }
             return

@@ -1,6 +1,5 @@
 package com.geniex.demo.server
 
-import com.geniex.demo.ChatRolePolicy
 import com.geniex.demo.GenerationConfigSample
 import com.geniex.demo.PerformanceTuning
 import com.geniex.demo.diagnostics.DiagnosticsLogger
@@ -13,6 +12,7 @@ import com.geniex.sdk.bean.VlmContent
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.ArrayDeque
 
 object InferenceBridge {
     private val mutex = Mutex()
@@ -157,16 +157,7 @@ object InferenceBridge {
     ): Result<Unit> {
         val llmRef = llm
         val vlmRef = vlm
-        val normalizedMessages = messages.map { (role, content) -> ChatRolePolicy.normalize(role) to content }
-        ChatRolePolicy.validateForGeneration(normalizedMessages.map { it.first })?.let { roleError ->
-            DiagnosticsLogger.log("WARN", "InferenceBridge", "rejected unsafe chat roles: $roleError")
-            return Result.failure(InvalidChatSequenceException(roleError))
-        }
-        val boundedMessages = boundMessages(normalizedMessages)
-        ChatRolePolicy.validateForGeneration(boundedMessages.map { it.first })?.let { roleError ->
-            DiagnosticsLogger.log("ERROR", "InferenceBridge", "history bounding produced invalid roles: $roleError")
-            return Result.failure(IllegalStateException("Internal chat history error: $roleError"))
-        }
+        val boundedMessages = boundMessages(messages)
         return when {
             llmRef != null -> streamLlmChat(llmRef, boundedMessages, enableThinking, maxTokens, onToken)
             vlmRef != null -> streamVlmChat(vlmRef, boundedMessages, enableThinking, maxTokens, onToken)
@@ -367,48 +358,44 @@ object InferenceBridge {
         if (messages.isEmpty()) return messages
         val mutable = messages.toMutableList()
         val firstConversationIndex = if (mutable.firstOrNull()?.first == "system") 1 else 0
-        val conversationRoles = mutable.drop(firstConversationIndex).map { it.first }
-        val removeCount = ChatRolePolicy.oldestTurnPrefixCount(conversationRoles)
-        if (removeCount == 0) return messages
-        repeat(removeCount) { mutable.removeAt(firstConversationIndex) }
+        // Never discard the latest message (normally the current user prompt).
+        if (mutable.size - firstConversationIndex <= 1) return messages
+
+        val removedRole = mutable.removeAt(firstConversationIndex).first
+        // Drop the assistant response paired with the removed user turn when
+        // possible, preventing orphaned assistant messages in the template.
+        if (removedRole == "user" &&
+            firstConversationIndex < mutable.lastIndex &&
+            mutable[firstConversationIndex].first == "assistant"
+        ) {
+            mutable.removeAt(firstConversationIndex)
+        }
         return mutable
     }
 
     private fun boundMessages(messages: List<Pair<String, String>>): List<Pair<String, String>> {
-        val initialChars = messages.sumOf { it.second.length }
         if (messages.size <= PerformanceTuning.MAX_API_MESSAGES &&
-            initialChars <= PerformanceTuning.MAX_API_HISTORY_CHARS
+            messages.sumOf { it.second.length } <= PerformanceTuning.MAX_API_HISTORY_CHARS
         ) return messages
 
-        // Input has already been validated as [system?], user, assistant, ..., user.
-        // Drop complete oldest user/assistant turns so bounding can never create
-        // an orphan assistant message that would crash strict native templates.
-        val system = messages.firstOrNull()?.takeIf { it.first == "system" }
-        val conversationStart = if (system != null) 1 else 0
-        val conversation = messages.drop(conversationStart).toMutableList()
-        var chars = (system?.second?.length ?: 0) + conversation.sumOf { it.second.length }
-
-        fun totalMessageCount(): Int = conversation.size + if (system != null) 1 else 0
-
-        while ((totalMessageCount() > PerformanceTuning.MAX_API_MESSAGES ||
-                chars > PerformanceTuning.MAX_API_HISTORY_CHARS) &&
-            conversation.size > 1
-        ) {
-            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(conversation.map { it.first })
-            if (removeCount == 0) break
-            repeat(removeCount) {
-                chars -= conversation.removeAt(0).second.length
-            }
+        val system = messages.firstOrNull { it.first == "system" }
+        val tail = ArrayDeque<Pair<String, String>>()
+        var chars = system?.second?.length ?: 0
+        for (message in messages.asReversed()) {
+            if (message === system) continue
+            if (tail.size >= PerformanceTuning.MAX_API_MESSAGES - if (system != null) 1 else 0) break
+            if (chars + message.second.length > PerformanceTuning.MAX_API_HISTORY_CHARS && tail.isNotEmpty()) break
+            tail.addFirst(message)
+            chars += message.second.length
         }
-
         val bounded = buildList {
             system?.let { add(it) }
-            addAll(conversation)
+            addAll(tail)
         }
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
-            "bounded API history messages=${messages.size}->${bounded.size} chars=$initialChars->$chars",
+            "bounded API history messages=${messages.size}->${bounded.size} chars=${messages.sumOf { it.second.length }}->$chars",
         )
         return bounded
     }
@@ -417,7 +404,6 @@ object InferenceBridge {
         value.coerceIn(1, PerformanceTuning.MAX_API_RESPONSE_TOKENS)
 
     class ContextLengthException(message: String) : IllegalArgumentException(message)
-    class InvalidChatSequenceException(message: String) : IllegalArgumentException(message)
 
     private const val DEFAULT_MAX_TOKENS = PerformanceTuning.DEFAULT_RESPONSE_TOKENS
 }
