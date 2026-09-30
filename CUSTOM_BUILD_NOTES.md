@@ -398,3 +398,9 @@ Static regression audit for this revision:
 - Background model downloads may continue while another model is loaded.
 
 See `AUDIT_V22_5.md` for the regression and static-validation details.
+
+## v22.6 Kotlin compile fix
+
+- Fixed GenieX 0.4.0 `VlmChatMessage.role` nullability at the two role-policy call sites introduced in v22.4/v22.5.
+- VLM roles are converted with `orEmpty()` before validation/trimming. A null role therefore becomes an invalid empty role and is rejected/repaired before any native chat-template/JNI call; it is not silently omitted.
+- This addresses the GitHub Actions `compileDebugKotlin` failures at `MainActivity.kt` lines 1733 and 1753 (`List<String?>` passed where `List<String>` is required).

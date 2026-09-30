@@ -1730,7 +1730,7 @@ class MainActivity : FragmentActivity() {
         val charLimit = minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
         var totalChars = vlmChatList.sumOf(::messageChars)
         while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES || totalChars > charLimit) {
-            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(vlmChatList.map { it.role })
+            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(vlmChatList.map { it.role.orEmpty() })
             if (removeCount == 0) break
             repeat(removeCount) {
                 totalChars -= messageChars(vlmChatList.removeAt(0))
@@ -1750,7 +1750,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun ensureValidVlmHistoryForTemplate(currentUser: VlmChatMessage) {
-        val roleError = ChatRolePolicy.validateForGeneration(vlmChatList.map { it.role }) ?: return
+        val roleError = ChatRolePolicy.validateForGeneration(vlmChatList.map { it.role.orEmpty() }) ?: return
         DiagnosticsLogger.log(
             "WARN",
             TAG,
