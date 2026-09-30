@@ -229,3 +229,11 @@ performance settings. GitHub Actions remains the authoritative Android `lintDebu
   launch stays on workspace setup instead of immediately repeating the crash.
 - GenieX SDK initialization failure now returns to workspace setup with the
   error preserved instead of leaving an unusable saved workspace.
+
+## v14 startup crash fix
+
+Fixed a startup race where `GenieXSdk.init()` could invoke `onSuccess()` synchronously
+before `MainActivity.initView()` had initialized `tvSelectedModel` and other view fields.
+This produced `UninitializedPropertyAccessException` immediately after workspace setup.
+The UI is now initialized before the SDK, and asynchronous UI refresh entry points are
+guarded until view binding is complete.

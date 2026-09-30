@@ -173,12 +173,18 @@ class MainActivity : FragmentActivity() {
             statusBarColorInt(getColor(R.color.bg_normal))
             statusBarDarkFont(true)
         }
-        initData()
+        // Build the UI before initializing GenieX. The SDK init callback may
+        // complete synchronously, so any callback that touches views must not
+        // run before lateinit view fields are assigned.
+        parseModelList()
         initView()
         uiReady = true
         setListeners()
+        initGenieXSdk()
         showInterruptedLoadWarning()
-        maybeResumePendingModelLoad()
+        if (sdkReady) {
+            maybeResumePendingModelLoad()
+        }
     }
 
     override fun onResume() {
@@ -318,6 +324,18 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun refreshSelectedModelUi() {
+        // This method is called from asynchronous SDK/model-manager callbacks.
+        // Never touch lateinit views until the Activity UI is fully bound.
+        if (!uiReady ||
+            !::modelList.isInitialized ||
+            !::tvSelectedModel.isInitialized ||
+            !::tvSelectedModelStatus.isInitialized ||
+            !::btnLoadModel.isInitialized ||
+            !::btnUnloadModel.isInitialized ||
+            !::btnStop.isInitialized
+        ) {
+            return
+        }
         val model = modelList.firstOrNull { it.id == selectModelId }
         if (model == null) {
             tvSelectedModel.text = "No model selected"
@@ -404,8 +422,10 @@ class MainActivity : FragmentActivity() {
                         // Re-query the configured persistent cache now that the
                         // model manager is initialized; this discovers models
                         // left in the workspace by a previous installation.
-                        refreshSelectedModelUi()
-                        maybeResumePendingModelLoad()
+                        if (uiReady) {
+                            refreshSelectedModelUi()
+                            maybeResumePendingModelLoad()
+                        }
                     }
                 }
 
