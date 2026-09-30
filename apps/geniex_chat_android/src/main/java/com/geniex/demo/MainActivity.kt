@@ -268,7 +268,6 @@ class MainActivity : FragmentActivity() {
         llDocuments = findViewById(R.id.ll_documents)
         tvAttachedDocuments = findViewById(R.id.tv_attached_documents)
         tvDocumentStatus = findViewById(R.id.tv_document_status)
-        refreshDocumentUi()
         tvSelectedModel = findViewById(R.id.tv_selected_model)
         tvSelectedModelStatus = findViewById(R.id.tv_selected_model_status)
         tvServerStatusCompact = findViewById(R.id.tv_server_status_compact)
@@ -291,6 +290,9 @@ class MainActivity : FragmentActivity() {
         topScrollContainer = findViewById(R.id.ll_images_container)
         llLoading = findViewById(R.id.ll_loading)
         vTip = findViewById<View>(R.id.v_tip)
+        // All views used by state refresh helpers must be bound before any
+        // refresh method runs. Some of these helpers call each other.
+        refreshDocumentUi()
         syncSelectedModelFromPreferences()
         refreshSelectedModelUi()
         refreshServerStatusUi()
@@ -526,7 +528,12 @@ class MainActivity : FragmentActivity() {
      * attached image (VLM only).
      */
     private fun refreshSendButtonState() {
+        // Startup callbacks and document-state refreshes can arrive while the
+        // activity is still binding views. Never dereference a lateinit view
+        // until the complete composer/control set exists.
+        if (!::etInput.isInitialized || !::btnSend.isInitialized || !::btnStop.isInitialized) return
         runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
             val hasText = etInput.text?.isNotBlank() == true
             val hasImageAttachment = savedImageFiles.isNotEmpty()
             val hasDocuments = selectedDocuments.isNotEmpty()
@@ -1731,8 +1738,12 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun refreshDocumentUi(progress: String? = null) {
-        if (!::llDocuments.isInitialized) return
+        if (!::llDocuments.isInitialized ||
+            !::tvAttachedDocuments.isInitialized ||
+            !::tvDocumentStatus.isInitialized ||
+            !::btnDocumentMode.isInitialized) return
         runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
             val count = selectedDocuments.size
             llDocuments.visibility = if (count > 0) View.VISIBLE else View.GONE
             tvAttachedDocuments.text = if (count == 0) "" else buildString {

@@ -272,3 +272,11 @@ guarded until view binding is complete.
 - Model cards now show Download only when a model is absent, Load when it is downloaded, and Unload when it is active.
 - Loading from the Models screen now returns directly to chat and starts the existing backend-selection/load flow; it no longer merely updates a selection preference.
 - When another model is active, other model Load buttons are disabled with an explicit unload-first status to preserve the clean-process switching protections.
+
+## v18 startup crash fix
+
+Fixed a runtime startup crash introduced by the transcript/UI refresh path:
+`refreshDocumentUi()` could call `refreshSendButtonState()` before `btnSend`
+was initialized. The app now binds all composer/model/status views before any
+state refresh and adds defensive `lateinit`/Activity-lifecycle guards to the
+refresh helpers.
