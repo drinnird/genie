@@ -62,7 +62,4 @@
         <item name="rippleColor">@color/primary_container</item>
     </style>
 
-    <style name="TransparentBottomSheetDialog" parent="Theme.Design.Light.BottomSheetDialog">
-        <item name="android:windowBackground">@android:color/transparent</item>
-    </style>
 </resources>

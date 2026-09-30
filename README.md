@@ -65,6 +65,10 @@ instead of crash-looping the application.
 
 Model downloads are verified after completion by resolving the path reported by `ModelManagerWrapper.getPaths()`. If the SDK ever reports a path outside `Genie/models/`, the app records that path in diagnostics and shows a storage-verification warning rather than silently implying the download is persistent.
 
+### Hugging Face download path
+
+Public Hugging Face GGUF entries use ordinary resumable HTTPS downloads rather than GenieX's native Hugging Face pull implementation. Files are staged under `Genie/temp/huggingface/`, resumed with HTTP `Range` when a `.part` file exists, and then imported into the persistent GenieX cache through `HubSource.LOCALFS`. VLM entries download the matching model GGUF plus an `mmproj` GGUF. Qualcomm AI Hub/QAIRT entries still use the native GenieX model-manager pull path.
+
 ## v15 web authentication and context management
 
 The browser chat now prompts clearly for the Android server API key before sending authenticated requests. Chat/completion output is context-budgeted: the app reserves context headroom, caps response length to available space, and drops the oldest chat turns when necessary while preserving the latest user prompt.

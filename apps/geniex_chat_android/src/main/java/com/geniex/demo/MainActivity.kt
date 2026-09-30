@@ -57,6 +57,7 @@ import com.geniex.demo.diagnostics.DiagnosticsActivity
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.documents.DocumentProcessor
 import com.geniex.demo.model.AppPreferences
+import com.geniex.demo.model.ModelDownloadCoordinator
 import com.geniex.demo.model.ModelManagementActivity
 import com.geniex.demo.server.InferenceBridge
 import com.geniex.demo.server.LocalApiService
@@ -74,22 +75,23 @@ import com.geniex.sdk.ModelManagerWrapper
 import com.geniex.sdk.VlmWrapper
 import com.geniex.sdk.bean.ChatMessage
 import com.geniex.sdk.bean.ComputeUnitValue
-import com.geniex.sdk.bean.HubSource
 import com.geniex.sdk.bean.LlmCreateInput
 import com.geniex.sdk.bean.LlmStreamResult
 import com.geniex.sdk.bean.ModelConfig
-import com.geniex.sdk.bean.ModelPullInput
 import com.geniex.sdk.bean.VlmChatMessage
 import com.geniex.sdk.bean.VlmContent
 import com.geniex.sdk.bean.VlmCreateInput
 import com.gyf.immersionbar.ktx.immersionBar
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileNotFoundException
@@ -914,49 +916,30 @@ class MainActivity : FragmentActivity() {
                 ).show()
             return
         }
+        if (ModelDownloadCoordinator.isAiHub(selectModelData) && selectModelData.chipset.isNullOrBlank()) {
+            Toast.makeText(
+                this@MainActivity,
+                "AI Hub models require a chipset. Update model_list.json.",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
 
         downloadingModelData = selectModelData
         llDownloading.visibility = View.VISIBLE
         tvDownloadProgress.text = "0%"
-
-        val hub =
-            runCatching { HubSource.valueOf(selectModelData.hub ?: "AUTO") }
-                .getOrDefault(HubSource.AUTO)
-        // AI Hub pulls route through chipset-matched assets. The Rust side
-        // can auto-detect the host only on Windows-on-Snapdragon, so on
-        // Android we must pass an explicit chipset for anything that ends
-        // up on the AI Hub path — whether hub is AIHUB or AUTO + ai-hub-models/*
-        // (or its canonical alias qualcomm/*).
-        val name = selectModelData.modelName
-        val isAiHubName =
-            name.startsWith("ai-hub-models/", ignoreCase = true) ||
-                name.startsWith("qualcomm/", ignoreCase = true)
-        val willUseAiHub =
-            hub == HubSource.AIHUB ||
-                (hub == HubSource.AUTO && isAiHubName)
-        if (willUseAiHub && selectModelData.chipset.isNullOrBlank()) {
-            llDownloading.visibility = View.GONE
-            Toast.makeText(this@MainActivity, "AI Hub models require a chipset. Update model_list.json.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val input =
-            ModelPullInput(
-                model_name = selectModelData.modelName,
-                precision = selectModelData.quant,
-                hub = hub,
-                chipset = selectModelData.chipset,
-                display_name = selectModelData.aiHubDisplayName,
-            )
+        DiagnosticsLogger.checkpoint(
+            "MODEL_DOWNLOAD_BEGIN",
+            "${selectModelData.modelName}:${selectModelData.quant.orEmpty()}",
+        )
 
         val wakeLock =
             (getSystemService(Context.POWER_SERVICE) as PowerManager)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "geniex:model_download")
-        wakeLock.acquire()
-        downloadJob =
-            modelScope.launch {
-                try {
-                    // Short-circuit if already cached — the manager filters .inflight/
-                    // models out of list(), so this only matches a complete pull.
+        wakeLock.acquire(DOWNLOAD_WAKELOCK_TIMEOUT_MS)
+        val newDownloadJob = modelScope.launch(start = CoroutineStart.LAZY) {
+            val thisJob = coroutineContext[Job]
+            try {
                     if (isModelDownloaded(selectModelData)) {
                         runOnUiThread {
                             llDownloading.visibility = View.GONE
@@ -965,16 +948,13 @@ class MainActivity : FragmentActivity() {
                         return@launch
                     }
 
-                    ModelManagerWrapper.pullFlow(input).collect { event ->
+                    ModelDownloadCoordinator.downloadFlow(this@MainActivity, selectModelData).collect { event ->
                         when (event) {
-                            is ModelManagerWrapper.PullEvent.Progress -> {
-                                val total = event.files.sumOf { if (it.total_bytes > 0) it.total_bytes else 0L }
-                                val done = event.files.sumOf { it.downloaded_bytes }
-                                val percent = if (total > 0) ((done * 100) / total).toInt() else 0
-                                runOnUiThread { tvDownloadProgress.text = "$percent%" }
+                            is ModelDownloadCoordinator.Event.Progress -> {
+                                runOnUiThread { tvDownloadProgress.text = "${event.percent}%" }
                             }
 
-                            is ModelManagerWrapper.PullEvent.Completed -> {
+                            is ModelDownloadCoordinator.Event.Completed -> {
                                 val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)
                                 val persistent = WorkingDirectoryManager.isPersistentModelPath(
                                     this@MainActivity,
@@ -986,6 +966,7 @@ class MainActivity : FragmentActivity() {
                                 )
                                 runOnUiThread {
                                     llDownloading.visibility = View.GONE
+                                    tvDownloadProgress.text = "100%"
                                     Toast
                                         .makeText(
                                             this@MainActivity,
@@ -999,24 +980,35 @@ class MainActivity : FragmentActivity() {
                                 }
                             }
 
-                            is ModelManagerWrapper.PullEvent.Error -> {
-                                Log.e(TAG, "pull failed rc=${event.code}: ${event.message}")
+                            is ModelDownloadCoordinator.Event.Error -> {
+                                Log.e(
+                                    TAG,
+                                    "model download failed code=${event.code ?: "http"}: ${event.message}",
+                                )
                                 runOnUiThread {
                                     llDownloading.visibility = View.GONE
                                     Toast
                                         .makeText(
                                             this@MainActivity,
-                                            "Download failed. Please check your network connection and try again.",
+                                            "Download failed: ${event.message}",
                                             Toast.LENGTH_LONG,
                                         ).show()
                                 }
                             }
                         }
                     }
-                } finally {
-                    if (wakeLock.isHeld) wakeLock.release()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } finally {
+                if (wakeLock.isHeld) wakeLock.release()
+                if (downloadJob === thisJob) {
+                    downloadingModelData = null
+                    downloadJob = null
                 }
             }
+        }
+        downloadJob = newDownloadJob
+        newDownloadJob.start()
     }
 
     private fun showAppMenu(anchor: View) {
@@ -1069,21 +1061,28 @@ class MainActivity : FragmentActivity() {
             clearHistory()
         }
         /*
-         * Step 3. download model. Cancelling the coroutine triggers the
-         * flow's awaitClose which flips the Rust progress callback to
-         * return false — partial files stay on disk for a resumed pull.
-         * Use the Retry button to kick off a fresh pull that resumes.
+         * Step 3. download model. Cancelling the coroutine closes the active
+         * HTTP/native pull. Standard Hugging Face downloads keep their .part
+         * file so Retry can resume with an HTTP Range request.
          */
         binding.btnCancelDownload.setOnClickListener {
             downloadJob?.cancel()
-            downloadJob = null
             tvDownloadProgress.text = "0%"
             binding.llDownloading.visibility = View.GONE
         }
         binding.btnRetryDownload.setOnClickListener {
-            downloadJob?.cancel()
-            downloadJob = null
-            downloadingModelData?.let { downloadModel(it) }
+            val retryModel = downloadingModelData ?: return@setOnClickListener
+            val previousJob = downloadJob
+            if (previousJob == null || !previousJob.isActive) {
+                downloadModel(retryModel)
+            } else {
+                previousJob.invokeOnCompletion {
+                    if (!isFinishing && !isDestroyed) {
+                        runOnUiThread { downloadModel(retryModel) }
+                    }
+                }
+                previousJob.cancel()
+            }
         }
         btnDownload.setOnClickListener {
             if (downloadJob?.isActive == true) {
@@ -2081,6 +2080,7 @@ class MainActivity : FragmentActivity() {
     }
 
     companion object {
+        private const val DOWNLOAD_WAKELOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L
         private const val REQUEST_TEXT_TRANSCRIPTS = 3001
         private const val REQUEST_MODEL_MANAGEMENT = 3002
         private const val MENU_MANAGE_MODELS = 4101

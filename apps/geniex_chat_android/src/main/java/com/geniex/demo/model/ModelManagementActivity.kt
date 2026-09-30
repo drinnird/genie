@@ -16,21 +16,22 @@ import com.geniex.demo.server.InferenceBridge
 import com.geniex.demo.storage.WorkingDirectoryManager
 import com.geniex.sdk.GenieXSdk
 import com.geniex.sdk.ModelManagerWrapper
-import com.geniex.sdk.bean.HubSource
-import com.geniex.sdk.bean.ModelPullInput
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 
 class ModelManagementActivity : FragmentActivity() {
     private lateinit var binding: ActivityModelsBinding
     private lateinit var models: List<ModelData>
     private lateinit var adapter: ModelManagementAdapter
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var states: List<ModelUiState> = emptyList()
+    @Volatile private var states: List<ModelUiState> = emptyList()
     private var downloadJob: Job? = null
     @Volatile private var sdkReady = false
 
@@ -84,7 +85,6 @@ class ModelManagementActivity : FragmentActivity() {
 
     private fun refreshStates() {
         scope.launch {
-            val selectedId = AppPreferences.getSelectedModelId(this@ModelManagementActivity)
             val activeId = InferenceBridge.activeModelId
             val refreshed = models.map { model ->
                 val old = states.firstOrNull { it.model.id == model.id }
@@ -92,7 +92,6 @@ class ModelManagementActivity : FragmentActivity() {
                 ModelUiState(
                     model = model,
                     available = available,
-                    selected = model.id == selectedId,
                     loaded = model.id == activeId,
                     blockedByActiveModel = activeId != null && activeId != model.id,
                     downloading = old?.downloading == true,
@@ -109,42 +108,29 @@ class ModelManagementActivity : FragmentActivity() {
             Toast.makeText(this, "Another model is already downloading.", Toast.LENGTH_SHORT).show()
             return
         }
-        val hub = runCatching { HubSource.valueOf(model.hub ?: "AUTO") }.getOrDefault(HubSource.AUTO)
-        val isAiHub = hub == HubSource.AIHUB ||
-            (hub == HubSource.AUTO && (model.modelName.startsWith("ai-hub-models/") || model.modelName.startsWith("qualcomm/")))
-        if (isAiHub && model.chipset.isNullOrBlank()) {
+        if (ModelDownloadCoordinator.isAiHub(model) && model.chipset.isNullOrBlank()) {
             Toast.makeText(this, "This AI Hub model has no chipset configured.", Toast.LENGTH_LONG).show()
             return
         }
         setState(model.id) { it.copy(downloading = true, progress = 0, error = null) }
         DiagnosticsLogger.checkpoint("MODEL_DOWNLOAD_BEGIN", "${model.modelName}:${model.quant.orEmpty()}")
 
-        val input = ModelPullInput(
-            model_name = model.modelName,
-            precision = model.quant,
-            hub = hub,
-            chipset = model.chipset,
-            display_name = model.aiHubDisplayName,
-        )
         val wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "geniex:model_management_download")
-        wakeLock.acquire(60 * 60 * 1000L)
-        downloadJob = scope.launch {
+        wakeLock.acquire(DOWNLOAD_WAKELOCK_TIMEOUT_MS)
+        val newDownloadJob = scope.launch(start = CoroutineStart.LAZY) {
+            val thisJob = coroutineContext[Job]
             try {
-                ModelManagerWrapper.pullFlow(input).collect { event ->
+                ModelDownloadCoordinator.downloadFlow(this@ModelManagementActivity, model).collect { event ->
                     when (event) {
-                        is ModelManagerWrapper.PullEvent.Progress -> {
-                            val total = event.files.sumOf { it.total_bytes }
-                            val done = event.files.sumOf { it.downloaded_bytes }
-                            val progress = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
-                            // Pull events can arrive much more frequently than the visible
-                            // percentage changes. Avoid allocating/submitting a new list for
-                            // duplicate progress values.
-                            if (states.firstOrNull { it.model.id == model.id }?.progress != progress) {
-                                setState(model.id) { it.copy(downloading = true, progress = progress, error = null) }
+                        is ModelDownloadCoordinator.Event.Progress -> {
+                            if (states.firstOrNull { it.model.id == model.id }?.progress != event.percent) {
+                                setState(model.id) {
+                                    it.copy(downloading = true, progress = event.percent, error = null)
+                                }
                             }
                         }
-                        is ModelManagerWrapper.PullEvent.Completed -> {
+                        is ModelDownloadCoordinator.Event.Completed -> {
                             val paths = ModelManagerWrapper.getPaths(model.modelName)
                             val persistent = WorkingDirectoryManager.isPersistentModelPath(
                                 this@ModelManagementActivity,
@@ -172,23 +158,42 @@ class ModelManagementActivity : FragmentActivity() {
                                 } else {
                                     "${model.displayName} downloaded, but storage verification failed."
                                 }
-                                Toast.makeText(this@ModelManagementActivity, message, if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
+                                Toast.makeText(
+                                    this@ModelManagementActivity,
+                                    message,
+                                    if (persistent) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
+                                ).show()
                             }
                         }
-                        is ModelManagerWrapper.PullEvent.Error -> {
-                            DiagnosticsLogger.log("ERROR", "ModelDownload", "${model.modelName}: ${event.code} ${event.message}")
+                        is ModelDownloadCoordinator.Event.Error -> {
+                            DiagnosticsLogger.log(
+                                "ERROR",
+                                "ModelDownload",
+                                "${model.modelName}: ${event.code ?: "http"} ${event.message}",
+                            )
                             setState(model.id) { it.copy(downloading = false, error = event.message) }
+                            runOnUiThread {
+                                Toast.makeText(
+                                    this@ModelManagementActivity,
+                                    "Download failed: ${event.message}",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
                         }
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 DiagnosticsLogger.log("ERROR", "ModelDownload", model.modelName, e)
                 setState(model.id) { it.copy(downloading = false, error = e.message ?: "download failed") }
             } finally {
                 if (wakeLock.isHeld) wakeLock.release()
-                downloadJob = null
+                if (downloadJob === thisJob) downloadJob = null
             }
         }
+        downloadJob = newDownloadJob
+        newDownloadJob.start()
     }
 
     private fun selectModel(model: ModelData) {
@@ -226,6 +231,7 @@ class ModelManagementActivity : FragmentActivity() {
             val result = runCatching { ModelManagerWrapper.remove(model.modelName) }
             result.onSuccess { code ->
                 DiagnosticsLogger.checkpoint("MODEL_DELETE", "${model.modelName} rc=$code")
+                if (code == 0) ModelDownloadCoordinator.discardStaging(this@ModelManagementActivity, model)
                 runOnUiThread {
                     if (code == 0) Toast.makeText(this@ModelManagementActivity, "Model deleted.", Toast.LENGTH_SHORT).show()
                     else Toast.makeText(this@ModelManagementActivity, "Delete failed (code $code).", Toast.LENGTH_LONG).show()
@@ -263,5 +269,6 @@ class ModelManagementActivity : FragmentActivity() {
         const val EXTRA_MODEL_ACTION = "model_action"
         const val ACTION_LOAD = "load"
         const val ACTION_UNLOAD = "unload"
+        private const val DOWNLOAD_WAKELOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L
     }
 }

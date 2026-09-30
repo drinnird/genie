@@ -30,6 +30,8 @@ object WorkingDirectoryManager {
     private const val KEY_MAIN_LAUNCH_PENDING = "main_launch_pending"
     private const val KEY_LAST_WORKSPACE_ERROR = "last_workspace_error"
     private const val WORKSPACE_NAME = "Genie"
+    private val modelManagerInitLock = Any()
+    @Volatile private var primedModelManagerPath: String? = null
 
     data class Workspace(
         val root: File,
@@ -240,25 +242,32 @@ object WorkingDirectoryManager {
      */
     private fun primeModelManager(workspace: Workspace) {
         val dataDir = workspace.root.canonicalPath
+        if (primedModelManagerPath == dataDir) return
 
-        // Loading the SDK singleton loads npu_jni without initializing the
-        // model manager. This makes the JNI methods safe to call directly via
-        // ModelManagerWrapper.init().
-        GenieXSdk.getInstance()
+        synchronized(modelManagerInitLock) {
+            if (primedModelManagerPath == dataDir) return
 
-        val result = runBlocking { ModelManagerWrapper.init(dataDir) }
-        result.getOrElse { error ->
-            throw IllegalStateException(
-                "Could not initialize the persistent GenieX model store at $dataDir",
-                error,
+            // Loading the SDK singleton loads npu_jni without initializing the
+            // model manager. This makes the JNI methods safe to call directly via
+            // ModelManagerWrapper.init(). The native store is first-init-wins, so
+            // this should run only once per app process for the configured path.
+            GenieXSdk.getInstance()
+
+            val result = runBlocking { ModelManagerWrapper.init(dataDir) }
+            result.getOrElse { error ->
+                throw IllegalStateException(
+                    "Could not initialize the persistent GenieX model store at $dataDir",
+                    error,
+                )
+            }
+            primedModelManagerPath = dataDir
+
+            DiagnosticsLogger.log(
+                "INFO",
+                "Workspace",
+                "GenieX model store initialized dataDir=$dataDir models=${workspace.models.canonicalPath}",
             )
         }
-
-        DiagnosticsLogger.log(
-            "INFO",
-            "Workspace",
-            "GenieX model store initialized dataDir=$dataDir models=${workspace.models.canonicalPath}",
-        )
     }
 
     fun modelStoragePath(context: Context): String? = workspace(context)?.models?.absolutePath

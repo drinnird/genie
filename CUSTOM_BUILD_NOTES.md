@@ -290,3 +290,19 @@ refresh helpers.
 - Model-download completion now resolves the SDK-reported model path and verifies that it is physically inside `Genie/models/`; diagnostics record the resolved path and verification result.
 - The Models screen now shows the exact model-storage path in addition to the workspace root.
 - No legacy private-model migration is included because this revision follows a clean reinstall; previous app-private files are not assumed to exist.
+
+## v20 standard Hugging Face downloads and audit hardening
+
+- Replaced the failing native Hugging Face pull path for `llama_cpp`/GGUF catalog entries with a conventional HTTPS downloader shared by both the chat screen and Models screen.
+- The downloader queries Hugging Face repository metadata, selects the configured GGUF quantization, supports split GGUF shards, and adds the preferred `mmproj-*.gguf` file for VLM entries.
+- Large model files stream through a 256 KiB buffer into resumable `.part` files. Retry uses HTTP `Range`; completed parts are atomically renamed before import.
+- Download staging lives under `Genie/temp/huggingface/`. After download, the local GGUF directory is registered through GenieX `HubSource.LOCALFS`; successful imports are verified under `Genie/models/` and staging is removed.
+- Qualcomm AI Hub/QAIRT models continue to use the GenieX native pull path because they require SDK-managed compiled bundles and chipset metadata.
+- Added storage preflight for the remaining transfer, the local-import cache copy, and 256 MiB headroom. Stale abandoned staging directories older than seven days are cleaned opportunistically.
+- Added bounded Hugging Face metadata parsing and throttled progress updates to avoid unnecessary heap growth and UI churn.
+- Fixed a download Retry/cancellation race where a cancelled job could clear the state of a newly-started replacement job.
+- Model-manager initialization is now process-idempotent, avoiding repeated synchronous JNI initialization as Activities open.
+- Diagnostic log truncation and workspace-log migration now stream data instead of loading multi-megabyte log files into the JVM heap; recent-log display reads only a bounded tail and diagnostic export streams `logcat` directly into the ZIP.
+- Removed unreferenced legacy `FileContentActivity`, `KeyboardUtil`, `SharePreferenceKeys`, its layout/manifest entry, and unused drawable/color/string/style resources.
+- Static re-audit passes: shell syntax, JSON parsing, all project XML parsing, manifest-to-class checks, local resource-reference checks, deleted-reference sweep, and Kotlin parser sweep. The new download coordinator also compiles in isolation against API-compatible Android/GenieX stubs and passes helper tests for quant matching, split-shard ordering, range parsing, and staging names.
+- A full Android `lintDebug assembleDebug` still cannot be executed in this sandbox because Gradle/Android SDK are not installed and external binary downloads are unavailable here. The repository's GitHub Actions build remains the authoritative full dependency/Android compile and lint gate.

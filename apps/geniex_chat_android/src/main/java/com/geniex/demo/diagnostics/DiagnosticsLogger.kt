@@ -9,6 +9,7 @@ import android.os.Process
 import android.os.SystemClock
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
@@ -39,6 +40,7 @@ object DiagnosticsLogger {
     private const val MAX_LOG_FILES = 5
     private const val MAX_SPECIAL_LOG_BYTES = 8L * 1024L * 1024L
     private const val MEMORY_SAMPLE_MS = 500L
+    private const val LOG_COPY_BUFFER_BYTES = 64 * 1024
     private const val NATIVE_SNAPSHOT_EVERY_SAMPLES = 4 // ~2 seconds
 
     private lateinit var appContext: Context
@@ -90,8 +92,15 @@ object DiagnosticsLogger {
                 oldLogDir.listFiles()?.filter { it.isFile }?.forEach { old ->
                     val target = File(newLogDir, old.name)
                     runCatching {
-                        if (!target.exists()) old.copyTo(target, overwrite = false)
-                        else target.appendText(old.readText())
+                        if (!target.exists()) {
+                            old.copyTo(target, overwrite = false)
+                        } else {
+                            old.inputStream().buffered(LOG_COPY_BUFFER_BYTES).use { input ->
+                                FileOutputStream(target, true).buffered(LOG_COPY_BUFFER_BYTES).use { output ->
+                                    input.copyTo(output, LOG_COPY_BUFFER_BYTES)
+                                }
+                            }
+                        }
                         old.delete()
                     }
                 }
@@ -285,8 +294,16 @@ object DiagnosticsLogger {
 
     fun readRecentLog(maxChars: Int = 30_000): String {
         if (!::currentLog.isInitialized || !currentLog.exists()) return "No application log yet."
-        val text = runCatching { currentLog.readText() }.getOrDefault("")
-        return if (text.length <= maxChars) text else text.takeLast(maxChars)
+        if (maxChars <= 0) return ""
+        return runCatching {
+            val maxBytes = (maxChars.toLong() * 4L).coerceAtMost(currentLog.length()).coerceAtMost(Int.MAX_VALUE.toLong())
+            val bytes = ByteArray(maxBytes.toInt())
+            RandomAccessFile(currentLog, "r").use { input ->
+                input.seek((input.length() - maxBytes).coerceAtLeast(0L))
+                input.readFully(bytes)
+            }
+            bytes.toString(Charsets.UTF_8).takeLast(maxChars)
+        }.getOrDefault("")
     }
 
     fun clearLogs() {
@@ -314,7 +331,7 @@ object DiagnosticsLogger {
         ZipOutputStream(FileOutputStream(zip)).use { zos ->
             addText(zos, "summary.txt", buildSummary(context))
             addText(zos, "process-exits.txt", buildProcessExitSummary(context))
-            addText(zos, "logcat-current.txt", captureOwnLogcat())
+            addOwnLogcat(zos)
             logDir.listFiles()?.sortedBy { it.name }?.forEach { file ->
                 if (file.isFile) {
                     zos.putNextEntry(ZipEntry("logs/${file.name}"))
@@ -579,7 +596,8 @@ object DiagnosticsLogger {
         }
     }
 
-    private fun captureOwnLogcat(): String =
+    private fun addOwnLogcat(zos: ZipOutputStream) {
+        zos.putNextEntry(ZipEntry("logcat-current.txt"))
         runCatching {
             val process = ProcessBuilder(
                 "logcat",
@@ -588,8 +606,13 @@ object DiagnosticsLogger {
                 "-v",
                 "threadtime",
             ).redirectErrorStream(true).start()
-            process.inputStream.bufferedReader().use { it.readText() }
-        }.getOrElse { "logcat unavailable: ${it.message}" }
+            process.inputStream.use { input -> input.copyTo(zos, LOG_COPY_BUFFER_BYTES) }
+            process.waitFor()
+        }.onFailure {
+            zos.write("logcat unavailable: ${it.message}".toByteArray())
+        }
+        zos.closeEntry()
+    }
 
     private fun addText(zos: ZipOutputStream, name: String, text: String) {
         zos.putNextEntry(ZipEntry(name))
@@ -610,15 +633,41 @@ object DiagnosticsLogger {
     }
 
     private fun appendBounded(file: File, text: String, maxBytes: Long, sync: Boolean = false) {
-        if (file.exists() && file.length() + text.toByteArray().size > maxBytes) {
-            val old = runCatching { file.readText() }.getOrDefault("")
-            val keep = old.takeLast((maxBytes / 2).toInt())
-            file.writeText("--- log truncated; newest half retained ---\n$keep")
+        val incoming = text.toByteArray()
+        if (file.exists() && file.length() + incoming.size > maxBytes) {
+            truncateToNewestHalf(file, maxBytes)
         }
         FileOutputStream(file, true).use { stream ->
-            stream.write(text.toByteArray())
+            stream.write(incoming)
             stream.flush()
             if (sync) runCatching { stream.fd.sync() }
+        }
+    }
+
+    private fun truncateToNewestHalf(file: File, maxBytes: Long) {
+        val keepBytes = (maxBytes / 2).coerceAtLeast(0L)
+        val temp = File(file.parentFile, file.name + ".truncate")
+        runCatching {
+            RandomAccessFile(file, "r").use { input ->
+                input.seek((input.length() - keepBytes).coerceAtLeast(0L))
+                FileOutputStream(temp, false).buffered(LOG_COPY_BUFFER_BYTES).use { output ->
+                    output.write("--- log truncated; newest half retained ---\n".toByteArray())
+                    val buffer = ByteArray(LOG_COPY_BUFFER_BYTES)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            if (file.exists() && !file.delete()) error("Could not replace truncated log ${file.name}")
+            if (!temp.renameTo(file)) error("Could not finalize truncated log ${file.name}")
+        }.onFailure {
+            temp.delete()
+            // Logging must never take down the app. If truncation fails, fall
+            // back to starting a fresh bounded file rather than reading the
+            // entire old log into the JVM heap.
+            runCatching { file.writeText("--- log reset after truncation failure ---\n") }
         }
     }
 

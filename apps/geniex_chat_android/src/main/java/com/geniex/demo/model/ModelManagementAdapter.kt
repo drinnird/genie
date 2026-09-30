@@ -11,7 +11,6 @@ import com.geniex.demo.databinding.ItemModelManagementBinding
 data class ModelUiState(
     val model: ModelData,
     val available: Boolean = false,
-    val selected: Boolean = false,
     val loaded: Boolean = false,
     val blockedByActiveModel: Boolean = false,
     val downloading: Boolean = false,

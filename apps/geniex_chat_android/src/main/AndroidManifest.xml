@@ -28,9 +28,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.GenieXDemo">
         <activity
-            android:name=".activity.FileContentActivity"
-            android:exported="false" />
-        <activity
             android:name=".model.ModelManagementActivity"
             android:exported="false" />
         <service
