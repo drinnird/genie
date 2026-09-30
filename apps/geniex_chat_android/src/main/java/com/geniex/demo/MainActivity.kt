@@ -4,16 +4,13 @@
 // ---------------------------------------------------------------------
 package com.geniex.demo
 
-import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
 import android.os.Process
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -28,7 +25,6 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.PopupWindow
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.SimpleAdapter
@@ -36,12 +32,8 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.FragmentActivity
-import androidx.recyclerview.widget.RecyclerView
 import com.geniex.demo.bean.ModelData
 import com.geniex.demo.bean.getSupportPluginIds
 import com.geniex.demo.databinding.ActivityMainBinding
@@ -51,6 +43,7 @@ import com.geniex.demo.diagnostics.DiagnosticsActivity
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.demo.documents.DocumentProcessor
 import com.geniex.demo.model.AppPreferences
+import com.geniex.demo.model.ModelCatalog
 import com.geniex.demo.model.ModelDownloadCoordinator
 import com.geniex.demo.model.ModelDownloadService
 import com.geniex.demo.model.ModelPathResolver
@@ -60,7 +53,6 @@ import com.geniex.demo.server.LocalApiService
 import com.geniex.demo.server.LocalApiServer
 import com.geniex.demo.server.ServerActivity
 import com.geniex.demo.storage.WorkingDirectoryManager
-import com.geniex.demo.utils.ExecShell
 import com.geniex.demo.utils.GgufVisionConfig
 import com.geniex.demo.utils.GgufVisionReader
 import com.geniex.demo.utils.ImgUtil
@@ -85,7 +77,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
-import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.Locale
 
@@ -117,11 +108,9 @@ class MainActivity : FragmentActivity() {
     private lateinit var btnModels: Button
     private lateinit var btnServer: Button
     private lateinit var btnDiagnostics: Button
-    private lateinit var btnModelPanelToggle: Button
     private lateinit var llModelPanelContent: LinearLayout
     private lateinit var btnSettingsMenu: View
 
-    private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: ChatAdapter
 
     private lateinit var scrollImages: HorizontalScrollView
@@ -135,21 +124,21 @@ class MainActivity : FragmentActivity() {
 
     private val chatList = arrayListOf<ChatMessage>()
     private val vlmChatList = arrayListOf<VlmChatMessage>()
-    private lateinit var modelList: List<ModelData>
+    private var modelList: List<ModelData> = emptyList()
     private var selectModelId = ""
 
-    private var isLoadLlmModel = false
-    private var isLoadVlmModel = false
+    @Volatile private var isLoadLlmModel = false
+    @Volatile private var isLoadVlmModel = false
 
     /**
      * Vision geometry of the currently loaded VLM, read from its mmproj GGUF.
      * Null for LLM-only models, and when the mmproj declares nothing usable —
      * image preprocessing then falls back to [FALLBACK_VLM_IMAGE_SIZE].
      */
-    private var vlmVisionConfig: GgufVisionConfig? = null
+    @Volatile private var vlmVisionConfig: GgufVisionConfig? = null
 
     private var enableThinking = false
-    private var isGenerating = false
+    @Volatile private var isGenerating = false
 
     private val savedImageFiles = mutableListOf<File>()
     private val selectedDocuments = mutableListOf<DocumentProcessor.DocumentRef>()
@@ -159,9 +148,9 @@ class MainActivity : FragmentActivity() {
     private var loadingMessageIndex: Int = -1
     private var streamingMessageIndex: Int = -1
     private var lastStreamUiUpdateMs: Long = 0L
-    private var sdkReady = false
+    @Volatile private var sdkReady = false
     private var uiReady = false
-    private var nativeRuntimeWasUsed = false
+    @Volatile private var nativeRuntimeWasUsed = false
     private var pendingResumeAttempted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -194,7 +183,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (::modelList.isInitialized && ::spModelList.isInitialized) {
+        if (::spModelList.isInitialized && modelList.isNotEmpty()) {
             syncSelectedModelFromPreferences()
             refreshSelectedModelUi()
             refreshServerStatusUi()
@@ -266,7 +255,6 @@ class MainActivity : FragmentActivity() {
         btnModels = findViewById(R.id.btn_models)
         btnServer = findViewById(R.id.btn_server)
         btnDiagnostics = findViewById(R.id.btn_diagnostics)
-        btnModelPanelToggle = findViewById(R.id.btn_model_panel_toggle)
         llModelPanelContent = findViewById(R.id.ll_model_panel_content)
         btnSettingsMenu = findViewById(R.id.btn_settings_menu)
         // The former model-control card is intentionally gone. Keep the hidden
@@ -289,53 +277,17 @@ class MainActivity : FragmentActivity() {
         refreshSelectedModelUi()
         refreshServerStatusUi()
 
-        findViewById<Button>(R.id.btn_test).setOnClickListener {
-            Thread {
-                val exeFile = File(filesDir, "geniex_test_llm")
-                val chmodProcess = Runtime.getRuntime().exec("chmod 755 " + exeFile.absolutePath)
-                chmodProcess.waitFor()
-                Log.d(TAG, "exeFile exe? ${exeFile.canExecute()}")
-                Log.d(TAG, "Exe Thread:${Thread.currentThread().name}")
-                ExecShell()
-                    .executeCommand(
-                        arrayOf(
-                            "cat",
-                            "/sys/devices/soc0/sku",
-                        ),
-                    ).forEach {
-                        Log.d(TAG, "cmd:$it")
-                    }
-            }.start()
-        }
-
         findViewById<View>(R.id.v_tip).setOnClickListener {
             Toast.makeText(this, "please unload model first", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun toggleModelPanel() {
-        val collapsed = !AppPreferences.isModelPanelCollapsed(this)
-        AppPreferences.setModelPanelCollapsed(this, collapsed)
-        applyModelPanelCollapsedState()
-    }
-
-    private fun applyModelPanelCollapsedState() {
-        if (!::llModelPanelContent.isInitialized || !::btnModelPanelToggle.isInitialized) return
-        val collapsed = AppPreferences.isModelPanelCollapsed(this)
-        llModelPanelContent.visibility = if (collapsed) View.GONE else View.VISIBLE
-        btnModelPanelToggle.text = if (collapsed) "Expand" else "Collapse"
-        btnModelPanelToggle.contentDescription = if (collapsed) {
-            "Expand model controls"
-        } else {
-            "Collapse model controls"
-        }
-    }
 
     private fun syncSelectedModelFromPreferences() {
         if (modelList.isEmpty()) return
         val preferred = AppPreferences.getSelectedModelId(this)
         val index = modelList.indexOfFirst { it.id == preferred }.let { if (it >= 0) it else 0 }
-        if (preferred == null) AppPreferences.setSelectedModelId(this, modelList[index].id)
+        if (preferred != modelList[index].id) AppPreferences.setSelectedModelId(this, modelList[index].id)
         if (spModelList.selectedItemPosition != index) spModelList.setSelection(index)
         selectModelId = modelList[index].id
     }
@@ -344,7 +296,6 @@ class MainActivity : FragmentActivity() {
         // This method is called from asynchronous SDK/model-manager callbacks.
         // Never touch lateinit views until the Activity UI is fully bound.
         if (!uiReady ||
-            !::modelList.isInitialized ||
             !::tvSelectedModel.isInitialized ||
             !::tvSelectedModelStatus.isInitialized ||
             !::btnLoadModel.isInitialized ||
@@ -409,21 +360,12 @@ class MainActivity : FragmentActivity() {
 
     private fun parseModelList() {
         try {
-            val baseJson = assets.open("model_list.json").bufferedReader().use { it.readText() }
-            val json = Json { ignoreUnknownKeys = true }
-            modelList = json.decodeFromString<List<ModelData>>(baseJson)
+            modelList = ModelCatalog.load(this)
         } catch (e: Exception) {
+            modelList = emptyList()
             Log.e(TAG, "parseModelList: $e")
+            DiagnosticsLogger.log("ERROR", TAG, "model catalog parse failed", e)
         }
-    }
-
-    /**
-     * Step 0. Parse the model list and initialise the SDK. Model presence
-     * is queried from the Rust model manager, not tracked client-side.
-     */
-    private fun initData() {
-        parseModelList()
-        initGenieXSdk()
     }
 
     /**
@@ -1037,14 +979,22 @@ class MainActivity : FragmentActivity() {
                 }
                 return@setOnClickListener
             }
-            val selectModelData = modelList.first { it.id == selectModelId }
+            val selectModelData = modelList.firstOrNull { it.id == selectModelId }
+            if (selectModelData == null) {
+                Toast.makeText(this@MainActivity, "No valid model is selected.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             downloadModel(selectModelData)
         }
         /*
          * Step 4. load model
          */
         btnLoadModel.setOnClickListener {
-            val selectModelData = modelList.first { it.id == selectModelId }
+            val selectModelData = modelList.firstOrNull { it.id == selectModelId }
+            if (selectModelData == null) {
+                Toast.makeText(this@MainActivity, "No valid model is selected.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             Log.d(TAG, "current select model data:$selectModelData")
             if (hasLoadedModel()) {
                 Toast.makeText(this@MainActivity, "please unload first", Toast.LENGTH_SHORT).show()
@@ -1082,161 +1032,197 @@ class MainActivity : FragmentActivity() {
                 return@setOnClickListener
             }
 
-            // Guard against re-entry: a second click while a previous
-            // generate() is still running would race on the native handle
-            // and crash the app.
+            // UI inference and the local API share the same native model handle.
+            // InferenceBridge owns the process-wide mutex so Activity teardown can
+            // never strand a lock that blocks all future requests.
             if (isGenerating) return@setOnClickListener
             if (DocumentProcessor.isProcessing()) {
                 Toast.makeText(this, "A transcript task is already using the model.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            if (!InferenceBridge.mutex.tryLock()) {
+            if (InferenceBridge.isBusy()) {
                 Toast.makeText(this, "The model is busy serving another request.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+
+            val inputString = etInput.text.trim().toString()
+            val imageFiles = savedImageFiles.toList()
             isGenerating = true
             streamingMessageIndex = -1
             lastStreamUiUpdateMs = 0L
             DiagnosticsLogger.checkpoint("INFERENCE_BEGIN", "model=${InferenceBridge.activeModelName.orEmpty()}")
             refreshSendButtonState()
 
-            if (savedImageFiles.isNotEmpty()) {
-                messages.add(Message("", MessageType.IMAGES, savedImageFiles.map { it }))
-                reloadRecycleView()
-            }
-
-            val inputString = etInput.text.trim().toString()
-            etInput.setText("")
-            etInput.clearFocus()
-            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.hideSoftInputFromWindow(etInput.windowToken, 0)
-
-            if (inputString.isNotEmpty()) {
-                messages.add(Message(inputString, MessageType.USER))
-                reloadRecycleView()
-            }
-
-            showLoadingIndicator()
-
-            val supportFunctionCall = false
-            var tools: String? = null
-            if (supportFunctionCall) {
-                // if this model support 'function call'
-                tools =
-                    "[{\"type\":\"function\",\"function\":{\"name\": \"campaign_investigation\",\"description\": \"Check campaign limits and determine appropriate action. If customer has reached limit, return a message (hardcoded or generated by model). If limit not reached, contact support.\",\"parameters\": {\"type\": \"object\", \"properties\":{\"campaign_name\":{\"type\": \"string\",\"description\": \"The name of the campaign to investigate\"}}, \"required\":[\"campaign_name\"]}}}]"
-            }
-
-            if (!hasLoadedModel()) {
-                Toast.makeText(this@MainActivity, "model not loaded", Toast.LENGTH_SHORT).show()
-                isGenerating = false
-                InferenceBridge.mutex.unlock()
-                refreshSendButtonState()
-                return@setOnClickListener
-            }
-
             modelScope.launch {
-                try {
-                    val selectModelData = modelList.first { it.id == selectModelId }
-                    val isNpu = ModelPathResolver.resolve(this@MainActivity, selectModelData)?.runtime_id == "qairt"
-                    Log.d(TAG, "isNpu: $isNpu")
+                val ran = InferenceBridge.tryRunExclusive {
+                    try {
+                        if (!hasLoadedModel()) {
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "model not loaded", Toast.LENGTH_SHORT).show()
+                            }
+                            return@tryRunExclusive
+                        }
 
-                    val sb = StringBuilder()
-                    if (isLoadVlmModel) {
-                        val contents =
-                            savedImageFiles
-                                .map {
-                                    VlmContent("image", it.absolutePath)
-                                }.toMutableList()
-                        contents.add(VlmContent("text", inputString))
-                        clearImages()
-                        val sendMsg = VlmChatMessage(role = "user", contents = contents)
-                        vlmChatList.add(sendMsg)
-                        trimVlmHistoryForMemory()
+                        runOnUiThread {
+                            if (imageFiles.isNotEmpty()) {
+                                messages.add(Message("", MessageType.IMAGES, imageFiles))
+                                reloadRecycleView()
+                            }
+                            if (inputString.isNotEmpty()) {
+                                messages.add(Message(inputString, MessageType.USER))
+                                reloadRecycleView()
+                            }
+                            // Do not erase text the user typed after tapping Send.
+                            if (etInput.text.trim().toString() == inputString) etInput.setText("")
+                            etInput.clearFocus()
+                            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                            imm.hideSoftInputFromWindow(etInput.windowToken, 0)
+                            savedImageFiles.removeAll(imageFiles)
+                            refreshTopScrollContainer()
+                            showLoadingIndicator()
+                        }
 
-                        Log.d(TAG, "applying VLM chat template; turns=${vlmChatList.size}")
-                        vlmWrapper
-                            .applyChatTemplate(vlmChatList.toTypedArray(), tools, enableThinking)
-                            .onSuccess { result ->
-                                Log.d(TAG, "VLM chat template prepared; chars=${result.formattedText.length}")
-                                val baseConfig =
-                                    GenerationConfigSample().toGenerationConfig()
-                                // Only inject the current turn's media: SDK tokenizes
-                                // incrementally, so re-passing history bitmaps breaks
-                                // mtmd_tokenize (markers/bitmaps mismatch).
-                                val configWithMedia =
-                                    vlmWrapper.injectMediaPathsToConfig(
-                                        arrayOf(sendMsg),
-                                        baseConfig,
-                                    )
+                        val selectModelData = modelList.firstOrNull { it.id == selectModelId }
+                            ?: error("Selected model is no longer in the catalog")
+                        val isNpu = ModelPathResolver.resolve(this@MainActivity, selectModelData)?.runtime_id == "qairt"
+                        Log.d(TAG, "isNpu: $isNpu")
 
-                                Log.d(TAG, "Config has ${configWithMedia.imageCount} images")
-
+                        val sb = StringBuilder()
+                        val tools: String? = null
+                        if (isLoadVlmModel) {
+                            val contents = imageFiles
+                                .map { VlmContent("image", it.absolutePath) }
+                                .toMutableList()
+                            contents.add(VlmContent("text", inputString))
+                            val sendMsg = VlmChatMessage(role = "user", contents = contents)
+                            vlmChatList.add(sendMsg)
+                            trimVlmHistoryForMemory()
+                            var generationCompleted = false
+                            try {
+                                Log.d(TAG, "applying VLM chat template; turns=${vlmChatList.size}")
                                 vlmWrapper
-                                    .generateStreamFlow(
-                                        result.formattedText,
-                                        configWithMedia,
-                                    ).collect { handleResult(sb, it) }
-                            }.onFailure {
-                                runOnUiThread {
-                                    Toast
-                                        .makeText(
-                                            this@MainActivity,
-                                            it.message,
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
+                                    .applyChatTemplate(vlmChatList.toTypedArray(), tools, enableThinking)
+                                    .onSuccess { result ->
+                                        Log.d(TAG, "VLM chat template prepared; chars=${result.formattedText.length}")
+                                        val resetCode = vlmWrapper.reset()
+                                        check(resetCode == 0) { "VLM context reset failed (rc=$resetCode)" }
+                                        val baseConfig = GenerationConfigSample().toGenerationConfig()
+                                        // Only inject the current turn's media. The complete
+                                        // text prompt is rebuilt every request, while media
+                                        // paths must correspond only to current markers.
+                                        val configWithMedia = vlmWrapper.injectMediaPathsToConfig(
+                                            arrayOf(sendMsg),
+                                            baseConfig,
+                                        )
+                                        Log.d(TAG, "Config has ${configWithMedia.imageCount} images")
+                                        vlmWrapper
+                                            .generateStreamFlow(result.formattedText, configWithMedia)
+                                            .collect { streamResult ->
+                                                if (streamResult is LlmStreamResult.Completed) generationCompleted = true
+                                                handleResult(sb, streamResult)
+                                            }
+                                    }.onFailure { error ->
+                                        runOnUiThread {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                error.message ?: "VLM generation failed",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
+                                    }
+                            } finally {
+                                // A failed template/generation must not silently become
+                                // part of the next request's conversational history.
+                                if (!generationCompleted && vlmChatList.lastOrNull() === sendMsg) {
+                                    vlmChatList.removeAt(vlmChatList.lastIndex)
                                 }
                             }
-                    } else {
-                        chatList.add(ChatMessage(role = "user", inputString))
-                        trimLlmHistoryForMemory()
-                        // Apply chat template and generate
-                        llmWrapper
-                            .applyChatTemplate(
-                                chatList.toTypedArray(),
-                                tools,
-                                enableThinking,
-                            ).onSuccess { templateOutput ->
-                                Log.d(TAG, "LLM chat template prepared; chars=${templateOutput.formattedText.length}")
-                                val safeMaxTokens = InferenceBridge.safeResponseBudget(
-                                    templateOutput.formattedText,
-                                    PerformanceTuning.DEFAULT_RESPONSE_TOKENS,
-                                )
-                                if (safeMaxTokens < PerformanceTuning.MIN_RESPONSE_TOKENS) {
-                                    runOnUiThread {
-                                        Toast.makeText(
-                                            this@MainActivity,
-                                            "Conversation is too long for this model context. Clear older messages and try again.",
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                    }
-                                    return@onSuccess
-                                }
+                        } else {
+                            val sendMsg = ChatMessage(role = "user", inputString)
+                            chatList.add(sendMsg)
+                            trimLlmHistoryForMemory()
+                            var generationCompleted = false
+                            try {
                                 llmWrapper
-                                    .generateStreamFlow(
-                                        templateOutput.formattedText,
-                                        GenerationConfigSample(maxTokens = safeMaxTokens).toGenerationConfig(),
-                                    ).collect { streamResult ->
-                                        handleResult(sb, streamResult)
+                                    .applyChatTemplate(chatList.toTypedArray(), tools, enableThinking)
+                                    .onSuccess { templateOutput ->
+                                        Log.d(TAG, "LLM chat template prepared; chars=${templateOutput.formattedText.length}")
+                                        val safeMaxTokens = InferenceBridge.safeResponseBudget(
+                                            templateOutput.formattedText,
+                                            PerformanceTuning.DEFAULT_RESPONSE_TOKENS,
+                                        )
+                                        if (safeMaxTokens < PerformanceTuning.MIN_RESPONSE_TOKENS) {
+                                            runOnUiThread {
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "Conversation is too long for this model context. Clear older messages and try again.",
+                                                    Toast.LENGTH_LONG,
+                                                ).show()
+                                            }
+                                            return@onSuccess
+                                        }
+                                        // GenieX 0.4.x retains native KV state. This UI path
+                                        // sends the complete templated conversation each time,
+                                        // so reset before generation just like InferenceBridge.
+                                        val resetCode = llmWrapper.reset()
+                                        check(resetCode == 0) { "LLM context reset failed (rc=$resetCode)" }
+                                        llmWrapper
+                                            .generateStreamFlow(
+                                                templateOutput.formattedText,
+                                                GenerationConfigSample(maxTokens = safeMaxTokens).toGenerationConfig(),
+                                            ).collect { streamResult ->
+                                                if (streamResult is LlmStreamResult.Completed) generationCompleted = true
+                                                handleResult(sb, streamResult)
+                                            }
+                                    }.onFailure { error ->
+                                        runOnUiThread {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                error.message ?: "LLM generation failed",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
                                     }
-                            }.onFailure { error ->
-                                runOnUiThread {
-                                    Toast
-                                        .makeText(
-                                            this@MainActivity,
-                                            error.message,
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
+                            } finally {
+                                if (!generationCompleted && chatList.lastOrNull() === sendMsg) {
+                                    chatList.removeAt(chatList.lastIndex)
                                 }
                             }
+                        }
+                    } catch (error: kotlinx.coroutines.CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        DiagnosticsLogger.log("ERROR", TAG, "UI inference failed", error)
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                error.message ?: "Inference failed",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    } finally {
+                        removeLoadingIndicator()
+                        DiagnosticsLogger.checkpoint(
+                            "INFERENCE_COMPLETE",
+                            "model=${InferenceBridge.activeModelName.orEmpty()}",
+                        )
+                        runOnUiThread {
+                            isGenerating = false
+                            refreshSendButtonState()
+                        }
                     }
+                }
 
-                    clearImages()
-                } finally {
-                    removeLoadingIndicator()
-                    isGenerating = false
-                    if (InferenceBridge.mutex.isLocked) InferenceBridge.mutex.unlock()
-                    DiagnosticsLogger.checkpoint("INFERENCE_COMPLETE", "model=${InferenceBridge.activeModelName.orEmpty()}")
-                    refreshSendButtonState()
+                if (!ran) {
+                    runOnUiThread {
+                        isGenerating = false
+                        Toast.makeText(
+                            this@MainActivity,
+                            "The model became busy serving another request. Try again.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        refreshSendButtonState()
+                    }
                 }
             }
         }
@@ -1255,7 +1241,7 @@ class MainActivity : FragmentActivity() {
                 Toast.makeText(this@MainActivity, "Transcript processing is still running.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            if (!InferenceBridge.mutex.tryLock()) {
+            if (InferenceBridge.isBusy()) {
                 Toast.makeText(this@MainActivity, "Model is busy. Try again when inference finishes.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
@@ -1291,23 +1277,43 @@ class MainActivity : FragmentActivity() {
             }
             modelScope.launch {
                 try {
-                    if (isLoadVlmModel) {
-                        vlmWrapper.stopStream()
-                        vlmWrapper.destroy()
-                        vlmChatList.clear()
-                        settleAfterNativeUnload()
-                        handleUnloadResult(0)
-                    } else if (isLoadLlmModel) {
-                        llmWrapper.stopStream()
-                        llmWrapper.destroy()
-                        chatList.clear()
-                        settleAfterNativeUnload()
-                        handleUnloadResult(0)
-                    } else {
-                        handleUnloadResult(0)
+                    val ran = InferenceBridge.tryRunExclusive {
+                        if (isLoadVlmModel) {
+                            vlmWrapper.stopStream()
+                            vlmWrapper.destroy()
+                            vlmChatList.clear()
+                            settleAfterNativeUnload()
+                            handleUnloadResult(0)
+                        } else if (isLoadLlmModel) {
+                            llmWrapper.stopStream()
+                            llmWrapper.destroy()
+                            chatList.clear()
+                            settleAfterNativeUnload()
+                            handleUnloadResult(0)
+                        } else {
+                            handleUnloadResult(0)
+                        }
                     }
-                } finally {
-                    if (InferenceBridge.mutex.isLocked) InferenceBridge.mutex.unlock()
+                    if (!ran) {
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Model became busy. Try unload again when inference finishes.",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    DiagnosticsLogger.log("ERROR", TAG, "model unload failed", error)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            error.message ?: "Model unload failed",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                 }
             }
         }
@@ -1519,31 +1525,31 @@ class MainActivity : FragmentActivity() {
                 PerformanceTuning.CONTEXT_SAFETY_TOKENS -
                 PerformanceTuning.DEFAULT_RESPONSE_TOKENS)
                 .coerceAtLeast(PerformanceTuning.MIN_RESPONSE_TOKENS) * 2)
-        while (chatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
-            chatList.sumOf { it.content.length } > minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
-        ) {
+        val charLimit = minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
+        var totalChars = chatList.sumOf { it.content.length }
+        while (chatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES || totalChars > charLimit) {
             // Preserve the latest user turn even when it alone is very long. The
             // context-budget check after chat templating will then show a clear
             // message instead of silently deleting the user's prompt.
             if (chatList.size <= 1) break
-            chatList.removeAt(0)
+            totalChars -= chatList.removeAt(0).content.length
         }
     }
 
     private fun trimVlmHistoryForMemory() {
-        fun chars(): Int = vlmChatList.sumOf { message ->
+        fun messageChars(message: VlmChatMessage): Int =
             message.contents.sumOf { content -> if (content.type == "text") content.text?.length ?: 0 else 0 }
-        }
+
         val contextCharBudget =
             ((InferenceBridge.contextWindowTokens -
                 PerformanceTuning.CONTEXT_SAFETY_TOKENS -
                 PerformanceTuning.DEFAULT_RESPONSE_TOKENS)
                 .coerceAtLeast(PerformanceTuning.MIN_RESPONSE_TOKENS) * 2)
-        while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES ||
-            chars() > minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
-        ) {
+        val charLimit = minOf(PerformanceTuning.MAX_NATIVE_HISTORY_CHARS, contextCharBudget)
+        var totalChars = vlmChatList.sumOf(::messageChars)
+        while (vlmChatList.size > PerformanceTuning.MAX_NATIVE_HISTORY_MESSAGES || totalChars > charLimit) {
             if (vlmChatList.size <= 1) break
-            vlmChatList.removeAt(0)
+            totalChars -= messageChars(vlmChatList.removeAt(0))
         }
     }
 
@@ -1551,28 +1557,6 @@ class MainActivity : FragmentActivity() {
         val intent = Intent(Intent.ACTION_PICK, null)
         intent.setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
         startActivityForResult(intent, 1)
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-
-        if (requestCode == 0) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                openGallery()
-            } else {
-                Toast.makeText(this, "Not allow", Toast.LENGTH_SHORT).show()
-            }
-        } else if (requestCode == 2001) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                openCamera()
-            } else {
-                Toast.makeText(this, "Camera not allow", Toast.LENGTH_SHORT).show()
-            }
-        }
     }
 
     override fun onActivityResult(
@@ -1605,7 +1589,7 @@ class MainActivity : FragmentActivity() {
 
         modelScope.launch {
             var sourceFile: File? = null
-            val deleteSourceAfter = requestCode == 1 || requestCode == 1001
+            val deleteSourceAfter = requestCode == 1
             try {
                 sourceFile = when (requestCode) {
                     1 -> {
@@ -1618,7 +1602,6 @@ class MainActivity : FragmentActivity() {
                         } ?: return@launch
                         temp
                     }
-                    1001 -> photoFile
                     else -> null
                 }
                 val source = sourceFile ?: return@launch
@@ -1820,101 +1803,59 @@ class MainActivity : FragmentActivity() {
             Toast.makeText(this, "Transcript processing is still running.", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!InferenceBridge.mutex.tryLock()) {
+        if (InferenceBridge.isBusy()) {
             Toast.makeText(this, "Model is busy. Clear the chat after generation finishes.", Toast.LENGTH_SHORT).show()
             return
         }
 
-        chatList.clear()
-        vlmChatList.clear()
-        messages.clear()
-        clearImages()
-        reloadRecycleView()
         modelScope.launch {
             try {
-                if (isLoadLlmModel) llmWrapper.reset()
-                if (isLoadVlmModel) vlmWrapper.reset()
-            } finally {
-                if (InferenceBridge.mutex.isLocked) InferenceBridge.mutex.unlock()
+                val ran = InferenceBridge.tryRunExclusive {
+                    val resetCode = when {
+                        isLoadLlmModel -> llmWrapper.reset()
+                        isLoadVlmModel -> vlmWrapper.reset()
+                        else -> 0
+                    }
+                    if (resetCode != 0) {
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Could not reset model context (rc=$resetCode).",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                        return@tryRunExclusive
+                    }
+                    chatList.clear()
+                    vlmChatList.clear()
+                    runOnUiThread {
+                        messages.clear()
+                        clearImages()
+                        reloadRecycleView()
+                    }
+                }
+                if (!ran) {
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Model became busy. Clear the chat after generation finishes.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                DiagnosticsLogger.log("ERROR", TAG, "clear history reset failed", error)
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        error.message ?: "Could not clear model context",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             }
         }
-    }
-
-    private var popupWindow: PopupWindow? = null
-
-    private fun showPopupMenu(anchorView: View) {
-        if (popupWindow?.isShowing == true) {
-            popupWindow?.dismiss()
-            return
-        }
-
-        val popupView = LayoutInflater.from(this).inflate(R.layout.menu_layout, null)
-
-        popupWindow =
-            PopupWindow(
-                popupView,
-                anchorView.width * 2,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                true,
-            )
-
-        popupWindow?.isOutsideTouchable = true
-        popupWindow?.elevation = 10f
-
-        val btnCamera = popupView.findViewById<Button>(R.id.btn_camera)
-        val btnPhoto = popupView.findViewById<Button>(R.id.btn_photo)
-
-        btnCamera.setOnClickListener {
-            popupWindow?.dismiss()
-            checkAndOpenCamera()
-        }
-        btnPhoto.setOnClickListener {
-            popupWindow?.dismiss()
-            openGallery()
-        }
-
-        popupView.measure(
-            View.MeasureSpec.UNSPECIFIED,
-            View.MeasureSpec.UNSPECIFIED,
-        )
-        val popupHeight = popupView.measuredHeight
-        popupWindow?.showAsDropDown(anchorView, 0, -anchorView.height - popupHeight)
-    }
-
-    private var photoUri: Uri? = null
-    private var photoFile: File? = null
-
-    private fun checkAndOpenCamera() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                2001,
-            )
-        } else {
-            openCamera()
-        }
-    }
-
-    private fun openCamera() {
-        val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-        photoFile =
-            File(
-                getExternalFilesDir(Environment.DIRECTORY_PICTURES),
-                "photo_${System.currentTimeMillis()}.jpg",
-            )
-        photoUri =
-            FileProvider.getUriForFile(
-                this,
-                "${applicationContext.packageName}.fileprovider",
-                photoFile!!,
-            )
-
-        intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri)
-        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        startActivityForResult(intent, 1001)
     }
 
     private fun clearImages() {
@@ -1959,11 +1900,11 @@ class MainActivity : FragmentActivity() {
      */
     private fun trimUiTranscriptForMemory() {
         var removed = 0
-        fun chars(): Int = messages.sumOf { it.content.length }
+        var totalChars = messages.sumOf { it.content.length }
         while (messages.size > PerformanceTuning.MAX_UI_MESSAGES ||
-            (messages.size > 2 && chars() > PerformanceTuning.MAX_UI_CHARS)
+            (messages.size > 2 && totalChars > PerformanceTuning.MAX_UI_CHARS)
         ) {
-            messages.removeAt(0)
+            totalChars -= messages.removeAt(0).content.length
             removed += 1
         }
         if (removed <= 0) return
@@ -2011,7 +1952,6 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
-        popupWindow?.dismiss()
         // Model downloads belong to the foreground service and intentionally
         // outlive this Activity. Only model-loading/inference work is cancelled.
         modelLoadJob?.cancel()

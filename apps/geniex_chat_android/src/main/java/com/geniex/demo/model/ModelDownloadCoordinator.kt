@@ -535,6 +535,8 @@ object ModelDownloadCoordinator {
             try {
                 downloadOneFileAttempt(remote, partFile, finalFile, onBytes)
                 return
+            } catch (error: NonRetryableDownloadException) {
+                throw error
             } catch (error: IOException) {
                 lastError = error
                 if (attempt == MAX_TRANSFER_ATTEMPTS - 1) return@repeat
@@ -585,7 +587,9 @@ object ModelDownloadCoordinator {
                 }
                 throw IOException("Server rejected resume for ${remote.fileName}")
             } else if (code !in 200..299) {
-                throw IOException("HTTP $code downloading ${remote.fileName}")
+                val message = "HTTP $code downloading ${remote.fileName}"
+                if (isRetryableHttpStatus(code)) throw IOException(message)
+                throw NonRetryableDownloadException(message)
             }
 
             BufferedInputStream(connection.inputStream, IO_BUFFER_SIZE).use { input ->
@@ -783,6 +787,12 @@ object ModelDownloadCoordinator {
                 .toString(),
         )
 
+    private fun isRetryableHttpStatus(code: Int): Boolean =
+        code == HttpURLConnection.HTTP_CLIENT_TIMEOUT ||
+            code == 425 ||
+            code == 429 ||
+            code in 500..599
+
     private fun contentRangeTotal(value: String?): Long {
         if (value.isNullOrBlank()) return -1L
         val slash = value.lastIndexOf('/')
@@ -832,6 +842,8 @@ object ModelDownloadCoordinator {
     }
 
     private fun formatGiB(bytes: Long): String = String.format(Locale.US, "%.1f GiB", bytes / 1073741824.0)
+
+    private class NonRetryableDownloadException(message: String) : IOException(message)
 
     private data class RemoteFile(
         val fileName: String,

@@ -348,7 +348,7 @@ object DocumentProcessor {
     private fun transcriptChunkChars(instruction: String): Int {
         val context = InferenceBridge.contextWindowTokens.coerceAtLeast(512)
         val fixedPromptChars = CHUNK_SYSTEM_PROMPT.length + instruction.length + 260
-        val fixedPromptTokens = PerformanceTuning.estimatePromptTokens("x".repeat(fixedPromptChars))
+        val fixedPromptTokens = PerformanceTuning.estimatePromptTokensForChars(fixedPromptChars)
         val reservedTokens =
             PerformanceTuning.CONTEXT_SAFETY_TOKENS + PARTIAL_OUTPUT_TOKENS + fixedPromptTokens + 72
         return ((context - reservedTokens).coerceAtLeast(300) * 2).coerceIn(MIN_CHUNK_CHARS, MAX_CHUNK_CHARS)
@@ -382,7 +382,9 @@ object DocumentProcessor {
     """.trimIndent()
 
     private inline fun forEachTextChunk(file: File, maxChars: Int, consume: (String) -> Unit) {
+        require(maxChars > 0) { "Chunk size must be positive." }
         val overlapChars = minOf(120, maxChars / 8)
+        var emittedAny = false
         InputStreamReader(file.inputStream(), Charsets.UTF_8).buffered(64 * 1024).use { reader ->
             val readBuffer = CharArray(8192)
             val chunk = StringBuilder(maxChars + overlapChars)
@@ -397,7 +399,11 @@ object DocumentProcessor {
                     offset += take
                     if (chunk.length >= maxChars) {
                         val text = chunk.toString()
-                        consume(text.trim())
+                        val trimmed = text.trim()
+                        if (trimmed.isNotBlank()) {
+                            consume(trimmed)
+                            emittedAny = true
+                        }
                         val overlap = if (overlapChars > 0) text.takeLast(overlapChars) else ""
                         chunk.setLength(0)
                         chunk.append(overlap)
@@ -405,7 +411,9 @@ object DocumentProcessor {
                 }
             }
             val tail = chunk.toString().trim()
-            if (tail.isNotBlank() && tail.length > overlapChars) consume(tail)
+            // A tiny document may never fill one chunk; emit it once. After at
+            // least one full chunk, suppress a tail containing only overlap.
+            if (tail.isNotBlank() && (!emittedAny || tail.length > overlapChars)) consume(tail)
         }
     }
 

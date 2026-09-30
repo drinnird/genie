@@ -26,7 +26,6 @@ data class Message(
     val content: String,
     val type: MessageType,
     val images: List<File> = emptyList(),
-    val audio: List<File> = emptyList(),
 )
 
 enum class MessageType(
@@ -176,10 +175,6 @@ class ChatAdapter(
             tvMessage.text = message.content
         }
 
-        private fun dpToPx(
-            dp: Int,
-            context: android.content.Context,
-        ): Int = (dp * context.resources.displayMetrics.density).toInt()
     }
 
     class LoadingViewHolder(
@@ -208,6 +203,12 @@ class ChatAdapter(
             }
         }
 
+        fun clear() {
+            // Recycled holders otherwise keep ImageViews (and their decoded
+            // thumbnail bitmaps) alive until the holder is rebound.
+            imageContainer.removeAllViews()
+        }
+
         private fun decodeThumbnail(file: File, maxDimension: Int): android.graphics.Bitmap? {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -222,6 +223,11 @@ class ChatAdapter(
             }
             return BitmapFactory.decodeFile(file.absolutePath, options)
         }
+    }
+
+    override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
+        if (holder is ImagesViewHolder) holder.clear()
+        super.onViewRecycled(holder)
     }
 
     companion object {

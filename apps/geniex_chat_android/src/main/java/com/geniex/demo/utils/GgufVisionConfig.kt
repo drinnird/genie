@@ -45,7 +45,7 @@ data class GgufVisionConfig(
  * Qwen2.5-VL — so hardcoding one model's numbers silently mis-sizes every other
  * model in the catalog. The GenieX SDK does not surface them (there is no image
  * resolution field on GenerationConfig or ModelConfig as of geniex-android
- * 0.3.5), hence reading the file directly.
+ * 0.4.0), hence reading the file directly.
  *
  * Only the key-value block at the head of the file is read; tensor data is
  * never touched, so this stays cheap even for a multi-hundred-MB mmproj.

@@ -47,6 +47,11 @@ class LocalApiService : Service() {
             ?: AppPreferences.isLanEnabled(this)
         val key = intent?.getStringExtra(EXTRA_KEY) ?: AppPreferences.getApiKey(this)
 
+        val settingsChanged =
+            LocalApiServer.isRunning() &&
+                (LocalApiServer.port != port || LocalApiServer.lanEnabled != lan || LocalApiServer.apiKey != key)
+        if (settingsChanged) LocalApiServer.stop()
+
         val result = if (LocalApiServer.isRunning()) {
             Result.success(Unit)
         } else {
@@ -55,7 +60,7 @@ class LocalApiService : Service() {
 
         result.fold(
             onSuccess = {
-                acquireRuntimeLocks()
+                acquireRuntimeLocks(lan)
                 updateNotification()
                 DiagnosticsLogger.log("INFO", "ApiService", "foreground server service active")
             },
@@ -143,7 +148,7 @@ class LocalApiService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun acquireRuntimeLocks() {
+    private fun acquireRuntimeLocks(lanEnabled: Boolean) {
         if (wakeLock?.isHeld != true) {
             val power = getSystemService(PowerManager::class.java)
             wakeLock = power.newWakeLock(
@@ -155,15 +160,22 @@ class LocalApiService : Service() {
             }
         }
 
-        if (wifiLock?.isHeld != true) {
-            val wifi = applicationContext.getSystemService(WifiManager::class.java)
-            wifiLock = wifi.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                "$packageName:GenieXApiServerWifi",
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
+        if (lanEnabled) {
+            if (wifiLock?.isHeld != true) {
+                val wifi = applicationContext.getSystemService(WifiManager::class.java)
+                wifiLock = wifi.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                    "$packageName:GenieXApiServerWifi",
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
             }
+        } else {
+            // Loopback-only serving does not depend on Wi-Fi radio state. Avoid
+            // holding the high-performance Wi-Fi lock (and its battery cost).
+            runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+            wifiLock = null
         }
     }
 

@@ -36,6 +36,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 object LocalApiServer {
     private const val MAX_BODY_BYTES = 512 * 1024
     private const val MAX_TEXT_UPLOAD_BYTES = 64 * 1024 * 1024
+    private const val MAX_HEADER_COUNT = 100
+    private const val MAX_HEADER_BYTES = 64 * 1024
     private const val DEFAULT_MAX_TOKENS = 512
     private const val API_WORKER_THREADS = 4
     private val running = AtomicBoolean(false)
@@ -150,9 +152,20 @@ object LocalApiServer {
                 val method = parts[0].uppercase()
                 val path = parts[1].substringBefore('?')
                 val headers = linkedMapOf<String, String>()
+                var headerCount = 0
+                var headerBytes = 0
                 while (true) {
                     val line = readLine(input) ?: break
                     if (line.isEmpty()) break
+                    headerCount += 1
+                    headerBytes += line.length
+                    if (headerCount > MAX_HEADER_COUNT || headerBytes > MAX_HEADER_BYTES) {
+                        return writeJson(
+                            output,
+                            400,
+                            errorJson(400, "request headers too large", "invalid_request_error"),
+                        )
+                    }
                     val idx = line.indexOf(':')
                     if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
                 }

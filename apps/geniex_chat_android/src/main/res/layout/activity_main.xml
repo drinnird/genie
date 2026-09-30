@@ -106,11 +106,6 @@
                 android:layout_width="1dp"
                 android:layout_height="1dp" />
 
-            <Button
-                android:id="@+id/btn_model_panel_toggle"
-                android:layout_width="1dp"
-                android:layout_height="1dp" />
-
             <TextView
                 android:id="@+id/tv_server_status_compact"
                 android:layout_width="1dp"
@@ -133,12 +128,6 @@
         <View
             android:id="@+id/v_tip"
             android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:visibility="gone" />
-
-        <Button
-            android:id="@+id/btn_test"
-            android:layout_width="1dp"
             android:layout_height="1dp"
             android:visibility="gone" />
 

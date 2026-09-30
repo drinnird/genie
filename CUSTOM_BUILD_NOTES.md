@@ -337,3 +337,40 @@ refresh helpers.
 - Removed the obsolete `GenerationConfig.nPast` argument after the GenieX Android 0.4.0 migration. `GenerationConfig` no longer exposes that field.
 - Made `ModelDownloadCoordinator.hasPersistentDownloadFiles(...)` suspend-aware because GenieX 0.4.0 exposes `ModelManagerWrapper.getPaths(...)` as a suspend function. Its only UI caller already executes inside the activity coroutine scope.
 - These fixes address the two `compileDebugKotlin` errors reported by GitHub Actions run logs uploaded on 2026-09-30.
+
+## v22.2 context-state/document summarization fix (2026-09-30)
+
+- GenieX 0.4.0 removed the `GenerationConfig.nPast` field that v21 used with `nPast = 0` on every request. Without an equivalent reset, the native KV/context state persisted across full-prompt calls and could overflow after only a few document chunks.
+- `InferenceBridge` now calls `LlmWrapper.reset()` / `VlmWrapper.reset()` immediately before each full-prompt generation. This matches the bridge's stateless/full-history design and restores the old fresh-context behavior for chat, API, transcript summarization, and VLM text requests.
+- Normal-memory llama.cpp loads now use a 2048-token context (the GenieX `ModelConfig` baseline); devices with less than 4 GiB currently available remain at 1024 tokens. This reduces the number of map/reduce calls needed for large transcript files while retaining the conservative low-memory path.
+- Qualcomm QAIRT bundle context remains fixed by the compiled model package and is unchanged.
+
+## v22.3 memory, performance, concurrency, and dead-code audit (2026-09-30)
+
+- Fixed a remaining GenieX 0.4.x context regression in the Android chat UI. `MainActivity` had its own direct LLM/VLM generation path that bypassed the v22.2 `InferenceBridge.reset()` logic; the UI now resets native KV/context state before every full-prompt generation too.
+- Made the process-wide inference mutex private to `InferenceBridge` and added cancellation-safe `tryRunExclusive(...)` ownership. UI generation, unload, and clear-history no longer manually acquire/release the singleton mutex, eliminating a lock-leak race if an Activity is destroyed between `tryLock()` and coroutine execution.
+- Added defensive exception handling around unload and clear-history native operations while preserving coroutine cancellation.
+- Fixed tiny `.txt` inputs (shorter than the chunk overlap) being dropped without ever producing a document chunk.
+- Removed a temporary string allocation used only to estimate document prompt tokens; token estimation can now operate directly from a character count.
+- Added bounded HTTP request-header count/aggregate size to the local API in addition to the existing per-line/body limits.
+- The API foreground service now holds the high-performance Wi-Fi lock only in LAN mode. Loopback-only serving keeps the CPU wake lock but avoids unnecessary Wi-Fi power use. Starting the service with changed port/LAN/key settings now restarts the socket with those settings.
+- RecyclerView image holders clear decoded thumbnail views when recycled so bitmap references can be reclaimed sooner.
+- Model-catalog loading in `MainActivity` now reuses the shared `ModelCatalog` implementation, safely falls back to an empty catalog on parse failure, and repairs a stale selected-model preference when a catalog entry disappears.
+- Cross-thread model/runtime state used by the UI and IO scope is explicitly volatile where appropriate.
+- Removed unreachable/unused code and resources: legacy camera popup/capture path and CAMERA permission, hidden native test button and `ExecShell`, obsolete model-panel collapse preference/toggle, unused `Message.audio`, unused image downscale helper, unused workspace helpers, and other dead private functions/properties.
+- Updated stale GenieX version comments after the 0.4.0 migration.
+
+Static regression audit for this revision:
+
+- Android XML parse: pass (31 files)
+- model catalog JSON parse: pass
+- manifest component-to-source references: pass
+- Kotlin/Java local `R.*` resource references: pass
+- shell script `bash -n`: pass
+- project-wide dead private/public function declaration scan: no declaration-only functions found
+- unused Kotlin import heuristic: clean
+- Kotlin parser sweep: no syntax/parse diagnostics (full Android symbol resolution still requires Gradle/Android SDK)
+- `InferenceBridge` + generation/context policy targeted Kotlin compilation against GenieX-0.4.0-compatible stubs: pass
+- Final v22.3 hardening rolls back a just-added hidden LLM/VLM user turn when generation never reaches `Completed`, preventing failed/context-rejected requests from contaminating the next prompt.
+- Model downloads no longer retry permanent HTTP 4xx responses; 408/425/429, 5xx, and transport failures remain resumable/retryable.
+- History trimming now maintains a running character total instead of repeatedly summing every message during each removal pass.

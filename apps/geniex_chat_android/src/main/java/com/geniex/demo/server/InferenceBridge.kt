@@ -15,7 +15,7 @@ import kotlinx.coroutines.sync.withLock
 import java.util.ArrayDeque
 
 object InferenceBridge {
-    val mutex = Mutex()
+    private val mutex = Mutex()
 
     @Volatile
     private var llm: LlmWrapper? = null
@@ -97,6 +97,21 @@ object InferenceBridge {
     }
 
     fun isBusy(): Boolean = mutex.isLocked
+
+    /**
+     * Run a UI-owned model operation only when the native handle is immediately
+     * available. Keeping lock ownership here guarantees cancellation or an
+     * exception cannot strand the process-wide inference mutex.
+     */
+    suspend fun tryRunExclusive(block: suspend () -> Unit): Boolean {
+        if (!mutex.tryLock()) return false
+        return try {
+            block()
+            true
+        } finally {
+            mutex.unlock()
+        }
+    }
 
     suspend fun generateText(
         messages: List<Pair<String, String>>,
@@ -251,6 +266,13 @@ object InferenceBridge {
 
             var streamError: Throwable? = null
             return runCatching {
+                // GenieX 0.4.x removed GenerationConfig.nPast. This bridge always
+                // supplies a complete, freshly-templated prompt, so retaining the
+                // native KV cache would duplicate prior requests and eventually
+                // overflow the context window. reset() restores the old nPast=0
+                // behavior used by this app before the 0.4.x API migration.
+                val resetCode = wrapper.reset()
+                check(resetCode == 0) { "VLM context reset failed (rc=$resetCode)" }
                 val config = wrapper.injectMediaPathsToConfig(
                     chat,
                     GenerationConfigSample(maxTokens = budget).toGenerationConfig(),
@@ -277,6 +299,11 @@ object InferenceBridge {
     ): Result<Unit> {
         var streamError: Throwable? = null
         return runCatching {
+            // The bridge sends the entire prompt on every request. Clear the
+            // native conversation/KV state first; otherwise GenieX 0.4.x keeps
+            // prior request state after the old nPast=0 field was removed.
+            val resetCode = wrapper.reset()
+            check(resetCode == 0) { "LLM context reset failed (rc=$resetCode)" }
             wrapper.generateStreamFlow(
                 prompt,
                 GenerationConfigSample(maxTokens = sanitizeMaxTokens(maxTokens)).toGenerationConfig(),

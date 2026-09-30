@@ -11,7 +11,6 @@ object AppPreferences {
     private const val KEY_PENDING_MODEL = "pending_model"
     private const val KEY_PENDING_COMPUTE = "pending_compute"
     private const val KEY_RESUME_SERVER = "resume_server"
-    private const val KEY_MODEL_PANEL_COLLAPSED = "model_panel_collapsed"
 
     fun getSelectedModelId(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_SELECTED_MODEL, null)
@@ -76,14 +75,6 @@ object AppPreferences {
     fun setApiKey(context: Context, key: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SERVER_KEY, key).apply()
     }
-    fun isModelPanelCollapsed(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_MODEL_PANEL_COLLAPSED, false)
 
-    fun setModelPanelCollapsed(context: Context, collapsed: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_MODEL_PANEL_COLLAPSED, collapsed)
-            .apply()
-    }
 
 }

@@ -33,7 +33,7 @@ object PerformanceTuning {
         val lowMemory = availableBytes > 0L && availableBytes < LOW_MEMORY_BATCH_THRESHOLD_BYTES
         return if (lowMemory) {
             LlamaConfig(
-                nCtx = LLAMA_CONTEXT_TOKENS,
+                nCtx = LLAMA_LOW_MEMORY_CONTEXT_TOKENS,
                 nThreads = threads,
                 nBatch = 128,
                 nUBatch = 64,
@@ -58,7 +58,12 @@ object PerformanceTuning {
     // Generation/context policy. The loaded llama.cpp context is deliberately
     // conservative for phone memory, so output must be budgeted against the
     // prompt instead of blindly requesting a context-sized response.
-    const val LLAMA_CONTEXT_TOKENS = 1024
+    // GenieX itself defaults ModelConfig.nCtx to 2048. Keep that useful
+    // baseline on phones with adequate free RAM; fall back to 1024 only when
+    // Android reports less than our low-memory threshold. This also lets the
+    // streaming document summarizer process substantially larger chunks.
+    const val LLAMA_CONTEXT_TOKENS = 2048
+    const val LLAMA_LOW_MEMORY_CONTEXT_TOKENS = 1024
     const val QAIRT_CONTEXT_BUDGET_TOKENS = 2048
     const val DEFAULT_RESPONSE_TOKENS = 512
     const val MAX_API_RESPONSE_TOKENS = 2048
@@ -70,8 +75,10 @@ object PerformanceTuning {
     // intentionally overestimates ordinary English prompts and leaves headroom.
     private const val APPROX_CHARS_PER_TOKEN = 2
 
-    fun estimatePromptTokens(text: String): Int =
-        ((text.length + APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN).coerceAtLeast(1)
+    fun estimatePromptTokens(text: String): Int = estimatePromptTokensForChars(text.length)
+
+    fun estimatePromptTokensForChars(charCount: Int): Int =
+        ((charCount.coerceAtLeast(0) + APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN).coerceAtLeast(1)
 
     fun responseBudget(
         formattedPrompt: String,

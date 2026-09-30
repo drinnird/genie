@@ -166,11 +166,6 @@ object WorkingDirectoryManager {
         workspace
     }
 
-    /** Clear only the remembered selection. Persistent workspace files remain. */
-    fun forgetSelection(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().commit()
-    }
-
     private fun prepareAndApply(context: Context, root: File): Workspace {
         if (!root.exists() && !root.mkdirs()) error("Could not create ${root.absolutePath}")
         if (!root.isDirectory || !root.canRead() || !root.canWrite()) {
@@ -205,7 +200,7 @@ object WorkingDirectoryManager {
         Os.setenv("GENIEX_DATADIR", workspace.root.canonicalPath, true)
         DiagnosticsLogger.useWorkingDirectory(context, workspace.root)
 
-        // GenieX Android 0.3.5 does not consult GENIEX_DATADIR from
+        // GenieX Android 0.4.x does not consult GENIEX_DATADIR from
         // GenieXSdk.init(); it explicitly initializes its model manager at
         // context.filesDir/geniex. The native model-manager FFI is first-init
         // wins, however, and ModelManagerWrapper exposes an explicit data-dir
@@ -271,15 +266,6 @@ object WorkingDirectoryManager {
     }
 
     fun modelStoragePath(context: Context): String? = workspace(context)?.models?.absolutePath
-
-    fun isPersistentModelPath(context: Context, path: String?): Boolean {
-        if (path.isNullOrBlank()) return false
-        val models = workspace(context)?.models ?: return false
-        return runCatching {
-            val modelsPath = models.canonicalFile.toPath()
-            File(path).canonicalFile.toPath().startsWith(modelsPath)
-        }.getOrDefault(false)
-    }
 
     private fun workspaceFor(root: File): Workspace = Workspace(
         root = root,
