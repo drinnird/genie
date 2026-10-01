@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -48,6 +50,7 @@ class ServerActivity : FragmentActivity() {
         binding.btnCopyWebUrl.setOnClickListener { copy("Web chat URL", LocalApiServer.webUrl()) }
         binding.btnOpenWebUi.setOnClickListener { openWebUi() }
         binding.btnCopyApiUrl.setOnClickListener { copy("API URL", LocalApiServer.apiUrl()) }
+        binding.btnBackgroundPower.setOnClickListener { openBackgroundPowerSettings() }
         binding.btnCopyApiKey.setOnClickListener {
             val key = binding.etApiKey.text?.toString().orEmpty()
             if (key.isBlank()) Toast.makeText(this, "No API key is configured.", Toast.LENGTH_SHORT).show()
@@ -116,6 +119,34 @@ class ServerActivity : FragmentActivity() {
         binding.btnCopyWebUrl.isEnabled = running
         binding.btnOpenWebUi.isEnabled = running
         binding.btnCopyApiUrl.isEnabled = running
+        val power = getSystemService(PowerManager::class.java)
+        binding.tvBackgroundPowerStatus.text = if (power.isIgnoringBatteryOptimizations(packageName)) {
+            "Android Doze exemption is enabled. On Galaxy phones, Never sleeping apps is separate; add GenieX there too if screen-off inference is still throttled."
+        } else {
+            "Android Doze exemption is not enabled. On Galaxy phones, add GenieX to Never sleeping apps and set Apps > GenieX > Battery > Unrestricted if available."
+        }
+    }
+
+    private fun openBackgroundPowerSettings() {
+        // Samsung documents this intent for the Never sleeping apps exception list.
+        val samsungIntent = Intent("com.samsung.android.sm.ACTION_OPEN_CHECKABLE_LISTACTIVITY").apply {
+            setPackage("com.samsung.android.lool")
+            putExtra("activity_type", 2)
+        }
+        if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+            if (runCatching { startActivity(samsungIntent) }.isSuccess) return
+        }
+        if (runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }.isSuccess) return
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
+        }.onFailure {
+            Toast.makeText(this, "Unable to open background power settings.", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun openWebUi() {

@@ -84,3 +84,25 @@ The custom Android and browser chat UIs support multiple `.txt` lecture transcri
 ### Compact chat navigation
 
 The chat header shows the selected model and active compute backend. Use the gear button in the top-right for Models, Web server, and Diagnostics. Downloaded model cards expose **Load** rather than **Download**; the active model exposes **Unload**.
+
+## Remembered model and automatic switching (v22.5)
+
+GenieX remembers the last model that **successfully completed native loading**, together with its CPU/GPU/NPU compute choice, and restores it automatically on the next normal launch. Merely browsing or selecting another catalog row does not overwrite this remembered model. A previously interrupted native model load is not auto-restored on that launch, preventing a crash loop.
+
+When another downloaded model is selected, the Models screen now shows **Switch**. GenieX safely unloads the current native wrapper first, then uses its existing clean-runtime restart hand-off to load the requested replacement automatically. This avoids keeping two large model runtimes resident at once while preserving the native-memory safety behavior used for GPU/NPU/QAIRT switching. If the local API server was running, it is resumed after the replacement model loads.
+
+## v22.6 compile correction
+
+The VLM chat-role guard now accounts for GenieX 0.4.0 exposing `VlmChatMessage.role` as nullable. Null roles are treated as invalid and repaired before native template processing, while the role-policy APIs continue to operate on non-null strings.
+
+## v22.7 Qwen3.5 web-server stability
+
+Qwen3.5 GGUF text chat on the `llama_cpp` runtime no longer sends ordinary multi-turn histories through GenieX 0.4.0's native `applyChatTemplate()` path. Device diagnostics showed that llama.cpp's automatic Qwen3.5 Jinja parser can throw a C++ `std::invalid_argument` on a later `/v1/chat/completions` request; that exception escapes the current JNI boundary as `SIGABRT` and terminates the app.
+
+For Qwen3.5 text-only llama.cpp requests, GenieX now renders the supported ChatML prompt in Kotlin before inference. The workaround is deliberately narrow: Qwen3, QAIRT models, VLM media prompts, and other model families continue using their existing native template handling.
+
+## v22.8 browser Markdown, response length, and screen-off behavior
+
+The bundled web chat now requests the app's safe maximum output budget (currently 2048 tokens) instead of hard-coding 512. The inference bridge still reduces that number automatically when the current prompt/history needs more of the model context window. Assistant responses render common Markdown safely in the browser, and streaming output no longer forces the page back to the bottom after the user scrolls upward.
+
+The foreground API service already holds a partial CPU wake lock for the server lifetime and a high-performance Wi-Fi lock in LAN mode. The Server screen now links to background-power controls (including Samsung's Never sleeping apps screen when available), and diagnostics record screen/Doze/power-saver state plus wake/Wi-Fi lock status to make any remaining screen-off throttling measurable.

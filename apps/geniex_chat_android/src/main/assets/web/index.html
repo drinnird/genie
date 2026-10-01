@@ -79,6 +79,27 @@
       white-space: pre-wrap; overflow-wrap: anywhere;
     }
     .user .bubble { background: var(--user); box-shadow: none; }
+    .assistant .bubble.markdown { white-space: normal; }
+    .markdown > :first-child { margin-top: 0; }
+    .markdown > :last-child { margin-bottom: 0; }
+    .markdown p { margin: .55em 0; }
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 {
+      line-height: 1.25; margin: 1em 0 .45em; overflow-wrap: anywhere;
+    }
+    .markdown h1 { font-size: 1.45em; }
+    .markdown h2 { font-size: 1.3em; }
+    .markdown h3 { font-size: 1.16em; }
+    .markdown ul, .markdown ol { margin: .55em 0; padding-left: 1.6em; }
+    .markdown li { margin: .2em 0; }
+    .markdown blockquote { margin: .7em 0; padding: .15em .8em; border-left: 3px solid var(--line); color: var(--muted); }
+    .markdown code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; background: color-mix(in srgb, var(--text) 8%, transparent); padding: .12em .32em; border-radius: 5px; }
+    .markdown pre { margin: .8em 0; padding: 12px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--bg) 90%, var(--panel)); white-space: pre; }
+    .markdown pre code { background: transparent; padding: 0; border-radius: 0; }
+    .markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: .8em 0; }
+    .markdown th, .markdown td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+    .markdown th { background: color-mix(in srgb, var(--text) 6%, transparent); }
+    .markdown a { color: var(--accent); overflow-wrap: anywhere; }
+    .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
     .role { font-size: 11px; color: var(--muted); margin: 0 5px 4px; }
     .user .role { text-align: right; }
     .typing::after { content: "▍"; animation: blink 1s steps(1) infinite; }
@@ -196,6 +217,8 @@
   let busy = false;
   let modelLoaded = false;
   let apiKeyRequired = false;
+  let maxOutputTokens = 2048;
+  let followOutput = true;
   let activeController = null;
   let apiKey = sessionStorage.getItem('geniex_api_key') || '';
   let attachedFiles = [];
@@ -247,8 +270,181 @@
     els.prompt.style.height = `${Math.min(els.prompt.scrollHeight, 180)}px`;
   }
 
-  function scrollBottom() {
-    requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }));
+  function isNearBottom(threshold = 160) {
+    const doc = document.documentElement;
+    return window.scrollY + window.innerHeight >= doc.scrollHeight - threshold;
+  }
+
+  function scrollBottom(force = false) {
+    if (!force && !followOutput) return;
+    requestAnimationFrame(() => {
+      if (!force && !followOutput) return;
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+    });
+  }
+
+  window.addEventListener('scroll', () => {
+    followOutput = isNearBottom();
+  }, { passive: true });
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[ch]);
+  }
+
+  function safeHref(raw) {
+    const decoded = String(raw).replace(/&amp;/g, '&').trim();
+    try {
+      const url = new URL(decoded, window.location.href);
+      if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) return null;
+      return escapeHtml(decoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function renderInlineMarkdown(raw) {
+    const code = [];
+    let text = escapeHtml(raw);
+    text = text.replace(/`([^`\n]+)`/g, (_, value) => {
+      const marker = `@@GENIEX_INLINE_${code.length}@@`;
+      code.push(`<code>${value}</code>`);
+      return marker;
+    });
+    text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
+      const safe = safeHref(href);
+      return safe ? `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>` : `${label} (${href})`;
+    });
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    text = text.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?:;])/g, '$1<em>$2</em>');
+    text = text.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?:;])/g, '$1<em>$2</em>');
+    code.forEach((value, index) => {
+      text = text.replace(`@@GENIEX_INLINE_${index}@@`, value);
+    });
+    return text;
+  }
+
+  function splitTableRow(line) {
+    let value = line.trim();
+    if (value.startsWith('|')) value = value.slice(1);
+    if (value.endsWith('|')) value = value.slice(0, -1);
+    return value.split('|').map(cell => cell.trim());
+  }
+
+  function isTableDivider(line) {
+    const cells = splitTableRow(line);
+    return cells.length > 1 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+  }
+
+  // Safe, dependency-free Markdown renderer. Raw model HTML is always escaped
+  // before Markdown syntax is converted, so generated <script>/event attributes
+  // cannot become executable DOM.
+  function markdownToHtml(markdown) {
+    const lines = String(markdown || '').replace(/\r\n?/g, '\n').split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) { i += 1; continue; }
+
+      const fence = line.match(/^\s*```\s*([A-Za-z0-9_+.-]*)\s*$/);
+      if (fence) {
+        const lang = fence[1].replace(/[^A-Za-z0-9_+.-]/g, '');
+        const body = [];
+        i += 1;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
+        if (i < lines.length) i += 1;
+        out.push(`<pre><code${lang ? ` class="language-${lang}"` : ''}>${escapeHtml(body.join('\n'))}</code></pre>`);
+        continue;
+      }
+
+      const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+        i += 1;
+        continue;
+      }
+
+      if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+        out.push('<hr>'); i += 1; continue;
+      }
+
+      if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+        const headers = splitTableRow(line);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) rows.push(splitTableRow(lines[i++]));
+        out.push('<table><thead><tr>' + headers.map(cell => `<th>${renderInlineMarkdown(cell)}</th>`).join('') + '</tr></thead><tbody>' +
+          rows.map(row => '<tr>' + headers.map((_, idx) => `<td>${renderInlineMarkdown(row[idx] || '')}</td>`).join('') + '</tr>').join('') +
+          '</tbody></table>');
+        continue;
+      }
+
+      const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+      const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (unordered || ordered) {
+        const tag = unordered ? 'ul' : 'ol';
+        const items = [];
+        while (i < lines.length) {
+          const match = tag === 'ul' ? lines[i].match(/^\s*[-+*]\s+(.+)$/) : lines[i].match(/^\s*\d+[.)]\s+(.+)$/);
+          if (!match) break;
+          items.push(`<li>${renderInlineMarkdown(match[1])}</li>`);
+          i += 1;
+        }
+        out.push(`<${tag}>${items.join('')}</${tag}>`);
+        continue;
+      }
+
+      if (/^\s*>/.test(line)) {
+        const quote = [];
+        while (i < lines.length) {
+          const match = lines[i].match(/^\s*>\s?(.*)$/);
+          if (!match) break;
+          quote.push(match[1]); i += 1;
+        }
+        out.push(`<blockquote>${quote.map(renderInlineMarkdown).join('<br>')}</blockquote>`);
+        continue;
+      }
+
+      const paragraph = [line.trim()];
+      i += 1;
+      while (i < lines.length && lines[i].trim()) {
+        const next = lines[i];
+        if (/^\s*```/.test(next) || /^\s*#{1,6}\s+/.test(next) || /^\s*[-+*]\s+/.test(next) || /^\s*\d+[.)]\s+/.test(next) || /^\s*>/.test(next)) break;
+        if (next.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) break;
+        paragraph.push(next.trim()); i += 1;
+      }
+      out.push(`<p>${paragraph.map(renderInlineMarkdown).join('<br>')}</p>`);
+    }
+    return out.join('');
+  }
+
+  const pendingMarkdown = new WeakMap();
+
+  function setBubblePlain(bubble, text) {
+    const state = pendingMarkdown.get(bubble);
+    if (state?.timer) clearTimeout(state.timer);
+    pendingMarkdown.delete(bubble);
+    bubble.classList.remove('markdown');
+    bubble.textContent = text;
+  }
+
+  function setBubbleMarkdown(bubble, text, immediate = false) {
+    bubble.classList.add('markdown');
+    const previous = pendingMarkdown.get(bubble);
+    if (previous?.timer) clearTimeout(previous.timer);
+    const render = () => {
+      const follow = followOutput;
+      bubble.innerHTML = markdownToHtml(text);
+      pendingMarkdown.delete(bubble);
+      if (follow) scrollBottom();
+    };
+    if (immediate) render();
+    else pendingMarkdown.set(bubble, { timer: setTimeout(render, 90) });
   }
 
   function addBubble(role, text = '', error = false) {
@@ -261,11 +457,13 @@
     label.textContent = role === 'user' ? 'You' : 'Assistant';
     const bubble = document.createElement('div');
     bubble.className = `bubble${error ? ' error' : ''}`;
-    bubble.textContent = text;
+    if (role === 'assistant' && !error) setBubbleMarkdown(bubble, text, true);
+    else setBubblePlain(bubble, text);
     wrap.append(label, bubble);
     row.appendChild(wrap);
     els.messages.appendChild(row);
-    scrollBottom();
+    followOutput = true;
+    scrollBottom(true);
     return bubble;
   }
 
@@ -310,6 +508,7 @@
       const data = await models.json();
       const model = data.data?.[0];
       const contextWindow = model?.context_window || healthData.context_window;
+      maxOutputTokens = model?.max_output_tokens || healthData.max_output_tokens || 2048;
       els.model.textContent = model
         ? `${model.name || model.id} • ${(model.compute || 'unknown').toUpperCase()}${contextWindow ? ` • ${contextWindow} ctx` : ''}`
         : 'Model loaded';
@@ -402,10 +601,10 @@
               const data = JSON.parse(payload);
               if (data.error) throw new Error(data.error.message || 'Document summary failed');
               if (data.type === 'progress') {
-                assistantBubble.textContent = `${data.phase}${data.total ? ` • ${data.completed}/${data.total}` : ''}${data.detail ? ` • ${data.detail}` : ''}`;
+                setBubblePlain(assistantBubble, `${data.phase}${data.total ? ` • ${data.completed}/${data.total}` : ''}${data.detail ? ` • ${data.detail}` : ''}`);
               } else if (data.type === 'result') {
                 finalContent = data.content || '';
-                assistantBubble.textContent = finalContent;
+                setBubbleMarkdown(assistantBubble, finalContent, true);
               }
             }
           }
@@ -416,7 +615,7 @@
       } catch (err) {
         assistantBubble.classList.remove('typing');
         assistantBubble.classList.add('error');
-        assistantBubble.textContent = err?.name === 'AbortError' ? 'Document processing stopped.' : (err instanceof Error ? err.message : String(err));
+        setBubblePlain(assistantBubble, err?.name === 'AbortError' ? 'Document processing stopped.' : (err instanceof Error ? err.message : String(err)));
       }
     } else {
       addBubble('user', text);
@@ -434,11 +633,11 @@
         }
         const data = await response.json();
         assistantBubble.classList.remove('typing');
-        assistantBubble.textContent = data.answer || 'No answer returned.';
+        setBubbleMarkdown(assistantBubble, data.answer || 'No answer returned.', true);
       } catch (err) {
         assistantBubble.classList.remove('typing');
         assistantBubble.classList.add('error');
-        assistantBubble.textContent = err?.name === 'AbortError' ? 'Request stopped.' : (err instanceof Error ? err.message : String(err));
+        setBubblePlain(assistantBubble, err?.name === 'AbortError' ? 'Request stopped.' : (err instanceof Error ? err.message : String(err)));
       }
     }
     activeController = null;
@@ -483,7 +682,7 @@
           model: 'loaded-model',
           messages,
           stream: true,
-          max_tokens: 512
+          max_tokens: maxOutputTokens
         })
       });
 
@@ -519,22 +718,22 @@
             const token = data.choices?.[0]?.delta?.content || '';
             if (token) {
               answer += token;
-              assistantBubble.textContent = answer;
-              scrollBottom();
+              setBubbleMarkdown(assistantBubble, answer);
             }
           }
         }
       }
 
       assistantBubble.classList.remove('typing');
+      setBubbleMarkdown(assistantBubble, answer, true);
       messages.push({ role: 'assistant', content: answer });
     } catch (err) {
       assistantBubble.classList.remove('typing');
       if (err?.name === 'AbortError') {
-        assistantBubble.textContent = assistantBubble.textContent || 'Generation stopped.';
+        if (!assistantBubble.textContent) setBubblePlain(assistantBubble, 'Generation stopped.');
       } else {
         assistantBubble.classList.add('error');
-        assistantBubble.textContent = err instanceof Error ? err.message : String(err);
+        setBubblePlain(assistantBubble, err instanceof Error ? err.message : String(err));
       }
     } finally {
       activeController = null;

@@ -1,7 +1,9 @@
 package com.geniex.demo.server
 
+import com.geniex.demo.ChatRolePolicy
 import com.geniex.demo.GenerationConfigSample
 import com.geniex.demo.PerformanceTuning
+import com.geniex.demo.QwenTextChatTemplate
 import com.geniex.demo.diagnostics.DiagnosticsLogger
 import com.geniex.sdk.LlmWrapper
 import com.geniex.sdk.VlmWrapper
@@ -12,7 +14,6 @@ import com.geniex.sdk.bean.VlmContent
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.ArrayDeque
 
 object InferenceBridge {
     private val mutex = Mutex()
@@ -36,6 +37,10 @@ object InferenceBridge {
         private set
 
     @Volatile
+    var activeRuntimeId: String? = null
+        private set
+
+    @Volatile
     var contextWindowTokens: Int = PerformanceTuning.LLAMA_CONTEXT_TOKENS
         private set
 
@@ -44,6 +49,7 @@ object InferenceBridge {
         modelId: String,
         modelName: String,
         computeUnit: String?,
+        runtimeId: String,
         contextTokens: Int = PerformanceTuning.LLAMA_CONTEXT_TOKENS,
     ) {
         llm = wrapper
@@ -51,11 +57,12 @@ object InferenceBridge {
         activeModelId = modelId
         activeModelName = modelName
         requestedComputeUnit = computeUnit
+        activeRuntimeId = runtimeId
         contextWindowTokens = contextTokens.coerceAtLeast(256)
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
-            "LLM active model=$modelName compute=$computeUnit context=$contextWindowTokens",
+            "LLM active model=$modelName runtime=$runtimeId compute=$computeUnit context=$contextWindowTokens",
         )
     }
 
@@ -64,6 +71,7 @@ object InferenceBridge {
         modelId: String,
         modelName: String,
         computeUnit: String?,
+        runtimeId: String,
         contextTokens: Int = PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS,
     ) {
         vlm = wrapper
@@ -71,11 +79,12 @@ object InferenceBridge {
         activeModelId = modelId
         activeModelName = modelName
         requestedComputeUnit = computeUnit
+        activeRuntimeId = runtimeId
         contextWindowTokens = contextTokens.coerceAtLeast(256)
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
-            "VLM active model=$modelName compute=$computeUnit context=$contextWindowTokens",
+            "VLM active model=$modelName runtime=$runtimeId compute=$computeUnit context=$contextWindowTokens",
         )
     }
 
@@ -85,6 +94,7 @@ object InferenceBridge {
         activeModelId = null
         activeModelName = null
         requestedComputeUnit = null
+        activeRuntimeId = null
         contextWindowTokens = PerformanceTuning.LLAMA_CONTEXT_TOKENS
     }
 
@@ -157,7 +167,16 @@ object InferenceBridge {
     ): Result<Unit> {
         val llmRef = llm
         val vlmRef = vlm
-        val boundedMessages = boundMessages(messages)
+        val normalizedMessages = messages.map { (role, content) -> ChatRolePolicy.normalize(role) to content }
+        ChatRolePolicy.validateForGeneration(normalizedMessages.map { it.first })?.let { roleError ->
+            DiagnosticsLogger.log("WARN", "InferenceBridge", "rejected unsafe chat roles: $roleError")
+            return Result.failure(InvalidChatSequenceException(roleError))
+        }
+        val boundedMessages = boundMessages(normalizedMessages)
+        ChatRolePolicy.validateForGeneration(boundedMessages.map { it.first })?.let { roleError ->
+            DiagnosticsLogger.log("ERROR", "InferenceBridge", "history bounding produced invalid roles: $roleError")
+            return Result.failure(IllegalStateException("Internal chat history error: $roleError"))
+        }
         return when {
             llmRef != null -> streamLlmChat(llmRef, boundedMessages, enableThinking, maxTokens, onToken)
             vlmRef != null -> streamVlmChat(vlmRef, boundedMessages, enableThinking, maxTokens, onToken)
@@ -214,17 +233,16 @@ object InferenceBridge {
     ): Result<Unit> {
         var working = messages
         while (true) {
-            val chat = working.map { ChatMessage(role = it.first, content = it.second) }.toTypedArray()
-            val template = wrapper.applyChatTemplate(chat, null, enableThinking)
+            val formattedPrompt = formatLlmPrompt(wrapper, working, enableThinking)
                 .getOrElse { return Result.failure(it) }
-            val budget = safeResponseBudget(template.formattedText, maxTokens)
+            val budget = safeResponseBudget(formattedPrompt, maxTokens)
             if (budget >= PerformanceTuning.MIN_RESPONSE_TOKENS) {
-                return collectLlmStream(wrapper, template.formattedText, budget, onToken)
+                return collectLlmStream(wrapper, formattedPrompt, budget, onToken)
             }
 
             val trimmed = trimOldestTurn(working)
             if (trimmed.size >= working.size) {
-                return Result.failure(contextLengthError(template.formattedText, maxTokens))
+                return Result.failure(contextLengthError(formattedPrompt, maxTokens))
             }
             DiagnosticsLogger.log(
                 "INFO",
@@ -247,13 +265,18 @@ object InferenceBridge {
             val chat = working.map { (role, text) ->
                 VlmChatMessage(role = role, contents = listOf(VlmContent("text", text)))
             }.toTypedArray()
-            val template = wrapper.applyChatTemplate(chat, null, enableThinking)
-                .getOrElse { return Result.failure(it) }
-            val budget = safeResponseBudget(template.formattedText, maxTokens)
+            val formattedPrompt = if (usesSafeQwenTextTemplate()) {
+                QwenTextChatTemplate.render(working, enableThinking)
+            } else {
+                wrapper.applyChatTemplate(chat, null, enableThinking)
+                    .getOrElse { return Result.failure(it) }
+                    .formattedText
+            }
+            val budget = safeResponseBudget(formattedPrompt, maxTokens)
             if (budget < PerformanceTuning.MIN_RESPONSE_TOKENS) {
                 val trimmed = trimOldestTurn(working)
                 if (trimmed.size >= working.size) {
-                    return Result.failure(contextLengthError(template.formattedText, maxTokens))
+                    return Result.failure(contextLengthError(formattedPrompt, maxTokens))
                 }
                 DiagnosticsLogger.log(
                     "INFO",
@@ -277,7 +300,7 @@ object InferenceBridge {
                     chat,
                     GenerationConfigSample(maxTokens = budget).toGenerationConfig(),
                 )
-                wrapper.generateStreamFlow(template.formattedText, config).collect { result ->
+                wrapper.generateStreamFlow(formattedPrompt, config).collect { result ->
                     when (result) {
                         is LlmStreamResult.Token -> onToken(result.text)
                         is LlmStreamResult.Error -> streamError = result.throwable
@@ -323,6 +346,46 @@ object InferenceBridge {
     }
 
     /**
+     * Render a text-only Qwen3.5 prompt without crossing the native Jinja parser.
+     * Returns null for runtimes/model families that should retain native
+     * applyChatTemplate() behavior.
+     */
+    fun renderSafeTextChatPrompt(
+        messages: List<Pair<String, String>>,
+        enableThinking: Boolean,
+    ): String? = if (usesSafeQwenTextTemplate()) {
+        QwenTextChatTemplate.render(messages, enableThinking)
+    } else {
+        null
+    }
+
+    private suspend fun formatLlmPrompt(
+        wrapper: LlmWrapper,
+        messages: List<Pair<String, String>>,
+        enableThinking: Boolean,
+    ): Result<String> {
+        renderSafeTextChatPrompt(messages, enableThinking)?.let { formatted ->
+            DiagnosticsLogger.log(
+                "INFO",
+                "InferenceBridge",
+                "using Kotlin Qwen text template messages=${messages.size} runtime=${activeRuntimeId.orEmpty()}",
+            )
+            return Result.success(formatted)
+        }
+        return wrapper.applyChatTemplate(
+            messages.map { ChatMessage(role = it.first, content = it.second) }.toTypedArray(),
+            null,
+            enableThinking,
+        ).map { it.formattedText }
+    }
+
+    private fun usesSafeQwenTextTemplate(): Boolean = QwenTextChatTemplate.supports(
+        activeModelId,
+        activeModelName,
+        activeRuntimeId,
+    )
+
+    /**
      * Return the safe output budget for this already-templated prompt. This is
      * intentionally tokenizer-independent so it works with every GenieX backend.
      */
@@ -358,44 +421,48 @@ object InferenceBridge {
         if (messages.isEmpty()) return messages
         val mutable = messages.toMutableList()
         val firstConversationIndex = if (mutable.firstOrNull()?.first == "system") 1 else 0
-        // Never discard the latest message (normally the current user prompt).
-        if (mutable.size - firstConversationIndex <= 1) return messages
-
-        val removedRole = mutable.removeAt(firstConversationIndex).first
-        // Drop the assistant response paired with the removed user turn when
-        // possible, preventing orphaned assistant messages in the template.
-        if (removedRole == "user" &&
-            firstConversationIndex < mutable.lastIndex &&
-            mutable[firstConversationIndex].first == "assistant"
-        ) {
-            mutable.removeAt(firstConversationIndex)
-        }
+        val conversationRoles = mutable.drop(firstConversationIndex).map { it.first }
+        val removeCount = ChatRolePolicy.oldestTurnPrefixCount(conversationRoles)
+        if (removeCount == 0) return messages
+        repeat(removeCount) { mutable.removeAt(firstConversationIndex) }
         return mutable
     }
 
     private fun boundMessages(messages: List<Pair<String, String>>): List<Pair<String, String>> {
+        val initialChars = messages.sumOf { it.second.length }
         if (messages.size <= PerformanceTuning.MAX_API_MESSAGES &&
-            messages.sumOf { it.second.length } <= PerformanceTuning.MAX_API_HISTORY_CHARS
+            initialChars <= PerformanceTuning.MAX_API_HISTORY_CHARS
         ) return messages
 
-        val system = messages.firstOrNull { it.first == "system" }
-        val tail = ArrayDeque<Pair<String, String>>()
-        var chars = system?.second?.length ?: 0
-        for (message in messages.asReversed()) {
-            if (message === system) continue
-            if (tail.size >= PerformanceTuning.MAX_API_MESSAGES - if (system != null) 1 else 0) break
-            if (chars + message.second.length > PerformanceTuning.MAX_API_HISTORY_CHARS && tail.isNotEmpty()) break
-            tail.addFirst(message)
-            chars += message.second.length
+        // Input has already been validated as [system?], user, assistant, ..., user.
+        // Drop complete oldest user/assistant turns so bounding can never create
+        // an orphan assistant message that would crash strict native templates.
+        val system = messages.firstOrNull()?.takeIf { it.first == "system" }
+        val conversationStart = if (system != null) 1 else 0
+        val conversation = messages.drop(conversationStart).toMutableList()
+        var chars = (system?.second?.length ?: 0) + conversation.sumOf { it.second.length }
+
+        fun totalMessageCount(): Int = conversation.size + if (system != null) 1 else 0
+
+        while ((totalMessageCount() > PerformanceTuning.MAX_API_MESSAGES ||
+                chars > PerformanceTuning.MAX_API_HISTORY_CHARS) &&
+            conversation.size > 1
+        ) {
+            val removeCount = ChatRolePolicy.oldestTurnPrefixCount(conversation.map { it.first })
+            if (removeCount == 0) break
+            repeat(removeCount) {
+                chars -= conversation.removeAt(0).second.length
+            }
         }
+
         val bounded = buildList {
             system?.let { add(it) }
-            addAll(tail)
+            addAll(conversation)
         }
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
-            "bounded API history messages=${messages.size}->${bounded.size} chars=${messages.sumOf { it.second.length }}->$chars",
+            "bounded API history messages=${messages.size}->${bounded.size} chars=$initialChars->$chars",
         )
         return bounded
     }
@@ -404,6 +471,7 @@ object InferenceBridge {
         value.coerceIn(1, PerformanceTuning.MAX_API_RESPONSE_TOKENS)
 
     class ContextLengthException(message: String) : IllegalArgumentException(message)
+    class InvalidChatSequenceException(message: String) : IllegalArgumentException(message)
 
     private const val DEFAULT_MAX_TOKENS = PerformanceTuning.DEFAULT_RESPONSE_TOKENS
 }

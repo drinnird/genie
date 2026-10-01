@@ -195,6 +195,23 @@
                     android:layout_height="52dp"
                     android:layout_marginTop="16dp"
                     android:text="Start server" />
+
+                <TextView
+                    android:id="@+id/tv_background_power_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="14dp"
+                    android:text="Background power status"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_background_power"
+                    style="@style/Widget.GenieX.Button.Secondary"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="8dp"
+                    android:text="Background power settings" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

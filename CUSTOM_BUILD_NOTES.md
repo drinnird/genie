@@ -322,7 +322,7 @@ refresh helpers.
 
 ## v22 Qualcomm Hugging Face NPU bundles
 
-- Upgraded the Android GenieX dependency to `com.qualcomm.qti:geniex-android:0.4.0` and updated model-create call sites to the current Android `LlmCreateInput` / `VlmCreateInput` signatures. Thinking mode remains supplied through `applyChatTemplate(...)`.
+- Upgraded the Android GenieX dependency to `com.qualcomm.qti:geniex-android:0.4.0` and updated model-create call sites to the current Android `LlmCreateInput` / `VlmCreateInput` signatures. Thinking mode remains supplied through the model chat template; Qwen3.5 llama.cpp text chat uses the v22.7 Kotlin renderer to avoid a native parser abort.
 - Added a dedicated `QUALCOMM_HF_QAIRT` catalog/download path for Qualcomm-published, precompiled GenieX QAIRT bundles. The app resolves the current package dynamically from each official Qualcomm Hugging Face repo's `release_assets.json` instead of pinning a release/S3 URL.
 - Hardware selection is restricted to Snapdragon SM8750 and SM8850. The resolver prefers the current `*-for-galaxy` asset key and can fall back to the corresponding generic chipset key when Qualcomm's release metadata uses the older name.
 - Enabled the new path for `Qwen3-4B-Instruct-2507` and added a separate `Qwen3-VL-4B-Instruct (Qualcomm NPU • W4A16)` entry. Existing GGUF entries and the older base `Qwen3-4B` AI Hub entry are otherwise unchanged.
@@ -374,3 +374,52 @@ Static regression audit for this revision:
 - Final v22.3 hardening rolls back a just-added hidden LLM/VLM user turn when generation never reaches `Completed`, preventing failed/context-rejected requests from contaminating the next prompt.
 - Model downloads no longer retry permanent HTTP 4xx responses; 408/425/429, 5xx, and transport failures remain resumable/retryable.
 - History trimming now maintains a running character total instead of repeatedly summing every message during each removal pass.
+
+## v22.4 native chat-template crash hardening (2026-09-30)
+
+- Fixed a native `SIGABRT` in llama.cpp/GenieX `apply_chat_template()` caused by orphaned assistant history after memory trimming.
+- Chat history is now trimmed as complete user/assistant turns for both LLM and VLM paths.
+- Added `ChatRolePolicy` and pre-JNI role validation/repair so invalid message order cannot reach strict Qwen Jinja templates.
+- Local OpenAI-compatible chat requests now reject unsupported/non-alternating roles with HTTP 400 before streaming begins.
+- API history bounding preserves role alternation and the current user turn.
+- See `AUDIT_V22_4.md` for the diagnostic root cause and regression checks.
+
+## v22.5 remembered startup model + automatic switching
+
+- Persists the last successfully loaded model and compute unit separately from simple catalog selection.
+- Restores that last known-good model automatically after GenieX SDK initialization on normal startup.
+- Migrates an existing v22.4 last-successful load from completed diagnostics when possible.
+- Suppresses automatic restore after an interrupted native load for that launch, preserving crash-loop protection.
+- Models other than the active one now show **Switch** and remain actionable.
+- Switching obtains the inference lock, stops/destroys the old wrapper, releases model state, then uses the existing clean-process restarter to load the requested model automatically.
+- The local API server is stopped during a model switch and automatically resumed afterward if it was previously running.
+- Explicit model deletion clears the startup-restore record only when that deleted model was the remembered model; manual unload does not forget it.
+- Load/Unload actions no longer depend on programmatically clicking hidden compatibility buttons.
+- Background model downloads may continue while another model is loaded.
+
+See `AUDIT_V22_5.md` for the regression and static-validation details.
+
+## v22.6 Kotlin compile fix
+
+- Fixed GenieX 0.4.0 `VlmChatMessage.role` nullability at the two role-policy call sites introduced in v22.4/v22.5.
+- VLM roles are converted with `orEmpty()` before validation/trimming. A null role therefore becomes an invalid empty role and is rejected/repaired before any native chat-template/JNI call; it is not silently omitted.
+- This addresses the GitHub Actions `compileDebugKotlin` failures at `MainActivity.kt` lines 1733 and 1753 (`List<String?>` passed where `List<String>` is required).
+
+## v22.7 Qwen3.5 web-server native template crash fix (2026-09-30)
+
+- Diagnostics showed the local web server aborting in GenieX/llama.cpp `apply_chat_template()` with `std::invalid_argument: Unable to generate parser for this template` and Qwen3.5's `Unexpected message role` Jinja branch on a later multi-turn `/v1/chat/completions` request.
+- Valid role-order checks alone cannot make that native path safe because llama.cpp's Qwen3.5 automatic Jinja parser can fail before GenieX returns a Kotlin `Result`. The affected exception escapes JNI as `SIGABRT`.
+- Qwen3.5-family **text-only llama.cpp** requests now use a narrowly scoped Kotlin ChatML renderer instead of native `applyChatTemplate()`. This applies to both the local OpenAI-compatible web API and Android text chat.
+- The renderer follows the upstream Qwen3.5 text behavior for system/user/assistant turns, completed historical `<think>` removal, and thinking-enabled/disabled generation preambles.
+- Qwen3 (non-3.5), QAIRT, VLM media prompts, and unknown/future model families keep native templating.
+- The inference bridge records the active runtime and the API diagnostics expose runtime plus non-content request metadata for easier future crash correlation.
+
+## v22.8 web UI / long-response / background-power hardening (2026-09-30)
+
+- Removed the bundled browser's accidental `max_tokens: 512` ceiling. The browser and omitted API requests now ask for `PerformanceTuning.MAX_API_RESPONSE_TOKENS` (2048), while `InferenceBridge` still applies the actual context-aware safe budget.
+- `/health` and `/v1/models` expose `max_output_tokens` so the browser does not duplicate a hard-coded server limit.
+- Added safe dependency-free Markdown rendering for assistant browser output, including code blocks, lists, headings, links, tables, quotes, emphasis, and strikethrough. Generated raw HTML remains escaped and links are protocol-filtered.
+- Streaming Markdown updates are throttled and auto-scroll is now sticky only near the bottom; manual upward scrolling is respected.
+- Confirmed the foreground API service already holds a partial CPU wake lock for the full server session and a high-performance Wi-Fi lock in LAN mode. No redundant permanent lock was added.
+- Added Server-screen background-power settings. Samsung devices use Samsung's documented Never sleeping apps deep link when available; other devices open Android battery optimization settings.
+- API diagnostics now include requested max tokens plus screen-on/off, idle mode, power-saver state, and battery-optimization exemption. Service startup logs wake/Wi-Fi lock-held state.

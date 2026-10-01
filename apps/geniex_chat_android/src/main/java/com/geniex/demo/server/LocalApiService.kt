@@ -62,7 +62,13 @@ class LocalApiService : Service() {
             onSuccess = {
                 acquireRuntimeLocks(lan)
                 updateNotification()
-                DiagnosticsLogger.log("INFO", "ApiService", "foreground server service active")
+                val power = getSystemService(PowerManager::class.java)
+                DiagnosticsLogger.log(
+                    "INFO",
+                    "ApiService",
+                    "foreground server service active wake=${wakeLock?.isHeld == true} " +
+                        "wifi=${wifiLock?.isHeld == true} batteryExempt=${power.isIgnoringBatteryOptimizations(packageName)}",
+                )
             },
             onFailure = {
                 DiagnosticsLogger.log("ERROR", "ApiService", "foreground server start failed", it)

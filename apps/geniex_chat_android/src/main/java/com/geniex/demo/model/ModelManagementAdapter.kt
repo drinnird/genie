@@ -13,7 +13,7 @@ data class ModelUiState(
     val available: Boolean = false,
     val persistentFilesPresent: Boolean = false,
     val loaded: Boolean = false,
-    val blockedByActiveModel: Boolean = false,
+    val switchesActiveModel: Boolean = false,
     val downloading: Boolean = false,
     val progress: Int? = null,
     val error: String? = null,
@@ -56,7 +56,7 @@ class ModelManagementAdapter(
                 state.error != null -> "Download failed"
                 state.downloading -> state.progress?.let { "Downloading • $it%" } ?: "Downloading"
                 state.loaded -> "Active"
-                state.available && state.blockedByActiveModel -> "Available • unload active model to switch"
+                state.available && state.switchesActiveModel -> "Available • ready to switch"
                 state.available -> "Available • ready to load"
                 state.persistentFilesPresent -> "Stored files • incomplete or incompatible"
                 else -> "Not downloaded"
@@ -72,8 +72,12 @@ class ModelManagementAdapter(
 
             binding.btnModelUse.visibility =
                 if (state.available && !state.downloading) android.view.View.VISIBLE else android.view.View.GONE
-            binding.btnModelUse.isEnabled = state.available && !state.downloading && !state.blockedByActiveModel
-            binding.btnModelUse.text = if (state.loaded) "Unload" else "Load"
+            binding.btnModelUse.isEnabled = state.available && !state.downloading
+            binding.btnModelUse.text = when {
+                state.loaded -> "Unload"
+                state.switchesActiveModel -> "Switch"
+                else -> "Load"
+            }
             binding.btnModelUse.setOnClickListener { onUse(model) }
 
             // Do not show destructive controls for models that do not exist
