@@ -469,3 +469,7 @@ Validation for this revision:
 - Replaced per-update `RecyclerView.scrollToPosition(lastIndex)` with post-layout bottom-edge alignment.
 - User dragging disables auto-follow until the RecyclerView returns within 72dp of the actual bottom.
 - Completion/error/profile insertion no longer forces the user back to the bottom after they intentionally scroll upward.
+
+## v22.13
+- Fixed v22.12 Kotlin compile regression in `requestChatBottomScroll()`: `doOnNextLayout` supplies a generic `View`, so the callback now uses the concrete `binding.rvChat` `RecyclerView` before accessing `layoutManager`.
+- No functional change to progressive Markdown or bottom-edge auto-follow behavior.

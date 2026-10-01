@@ -1879,9 +1879,10 @@ class MainActivity : FragmentActivity() {
         if (force) chatAutoFollowEnabled = true
         if (!chatAutoFollowEnabled || messages.isEmpty() || chatBottomScrollPending) return
         chatBottomScrollPending = true
-        binding.rvChat.doOnNextLayout { recycler ->
+        binding.rvChat.doOnNextLayout {
             chatBottomScrollPending = false
             if (!chatAutoFollowEnabled || messages.isEmpty()) return@doOnNextLayout
+            val recycler = binding.rvChat
             val layoutManager = recycler.layoutManager as? LinearLayoutManager ?: return@doOnNextLayout
             val lastPosition = messages.lastIndex
             val lastView = layoutManager.findViewByPosition(lastPosition)
