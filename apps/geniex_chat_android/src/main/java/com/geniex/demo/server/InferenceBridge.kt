@@ -5,6 +5,7 @@ import com.geniex.demo.GenerationConfigSample
 import com.geniex.demo.PerformanceTuning
 import com.geniex.demo.QwenTextChatTemplate
 import com.geniex.demo.diagnostics.DiagnosticsLogger
+import com.geniex.demo.utils.GgufVisionConfig
 import com.geniex.sdk.LlmWrapper
 import com.geniex.sdk.VlmWrapper
 import com.geniex.sdk.bean.ChatMessage
@@ -44,6 +45,10 @@ object InferenceBridge {
     var contextWindowTokens: Int = PerformanceTuning.LLAMA_CONTEXT_TOKENS
         private set
 
+    @Volatile
+    private var activeVisionConfig: GgufVisionConfig? = null
+
+    @Synchronized
     fun setLlm(
         wrapper: LlmWrapper,
         modelId: String,
@@ -59,6 +64,7 @@ object InferenceBridge {
         requestedComputeUnit = computeUnit
         activeRuntimeId = runtimeId
         contextWindowTokens = contextTokens.coerceAtLeast(256)
+        activeVisionConfig = null
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
@@ -66,6 +72,7 @@ object InferenceBridge {
         )
     }
 
+    @Synchronized
     fun setVlm(
         wrapper: VlmWrapper,
         modelId: String,
@@ -73,6 +80,7 @@ object InferenceBridge {
         computeUnit: String?,
         runtimeId: String,
         contextTokens: Int = PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS,
+        visionConfig: GgufVisionConfig? = null,
     ) {
         vlm = wrapper
         llm = null
@@ -81,6 +89,7 @@ object InferenceBridge {
         requestedComputeUnit = computeUnit
         activeRuntimeId = runtimeId
         contextWindowTokens = contextTokens.coerceAtLeast(256)
+        activeVisionConfig = visionConfig
         DiagnosticsLogger.log(
             "INFO",
             "InferenceBridge",
@@ -88,6 +97,44 @@ object InferenceBridge {
         )
     }
 
+
+    data class ActiveModelSnapshot(
+        val llm: LlmWrapper?,
+        val vlm: VlmWrapper?,
+        val modelId: String,
+        val modelName: String,
+        val computeUnit: String?,
+        val runtimeId: String,
+        val contextTokens: Int,
+        val visionConfig: GgufVisionConfig?,
+    )
+
+    /**
+     * Snapshot the process-owned native model so a recreated Activity can adopt
+     * the existing wrapper instead of allocating the same multi-gigabyte model
+     * a second time. The bridge owns model lifetime across Activity instances.
+     */
+    @Synchronized
+    fun activeSnapshot(): ActiveModelSnapshot? {
+        val llmRef = llm
+        val vlmRef = vlm
+        if (llmRef == null && vlmRef == null) return null
+        val id = activeModelId ?: return null
+        val name = activeModelName ?: id
+        val runtime = activeRuntimeId ?: return null
+        return ActiveModelSnapshot(
+            llm = llmRef,
+            vlm = vlmRef,
+            modelId = id,
+            modelName = name,
+            computeUnit = requestedComputeUnit,
+            runtimeId = runtime,
+            contextTokens = contextWindowTokens,
+            visionConfig = activeVisionConfig,
+        )
+    }
+
+    @Synchronized
     fun clear() {
         llm = null
         vlm = null
@@ -96,6 +143,7 @@ object InferenceBridge {
         requestedComputeUnit = null
         activeRuntimeId = null
         contextWindowTokens = PerformanceTuning.LLAMA_CONTEXT_TOKENS
+        activeVisionConfig = null
     }
 
     fun isLoaded(): Boolean = llm != null || vlm != null

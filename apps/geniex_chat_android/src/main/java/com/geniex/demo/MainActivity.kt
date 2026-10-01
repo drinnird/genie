@@ -420,21 +420,17 @@ class MainActivity : FragmentActivity() {
             )
             DiagnosticsLogger.log("INFO", "ApiServer", "foreground server resume requested after model switch")
         }
+        updateUiForLoadedModel(tip)
+    }
+
+    private fun updateUiForLoadedModel(toast: String? = null) {
         runOnUiThread {
-            Toast
-                .makeText(
-                    this@MainActivity,
-                    tip,
-                    Toast.LENGTH_SHORT,
-                ).show()
-            // change UI
-            btnAddImage.visibility = View.GONE
-            if (isLoadVlmModel) {
-                btnAddImage.visibility = View.VISIBLE
-            }
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            toast?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show() }
+            btnAddImage.visibility = if (isLoadVlmModel) View.VISIBLE else View.GONE
             btnUnloadModel.visibility = View.VISIBLE
             llLoading.visibility = View.INVISIBLE
-            btnStop.visibility = View.VISIBLE
+            btnStop.visibility = if (isGenerating) View.VISIBLE else View.GONE
             refreshSendButtonState()
             refreshSelectedModelUi()
             refreshServerStatusUi()
@@ -483,8 +479,47 @@ class MainActivity : FragmentActivity() {
     private suspend fun isModelDownloaded(modelData: ModelData): Boolean =
         ModelPathResolver.isAvailable(this, modelData)
 
+    /**
+     * MainActivity can be destroyed/recreated while the foreground API service
+     * keeps the process and native model alive. Reuse that process-owned wrapper
+     * instead of allocating the same model again.
+     */
+    private fun adoptProcessModelIfPresent(): Boolean {
+        if (hasLoadedModel()) return true
+        val active = InferenceBridge.activeSnapshot() ?: return false
+        val model = modelList.firstOrNull { it.id == active.modelId }
+
+        when {
+            active.llm != null -> {
+                llmWrapper = active.llm
+                isLoadLlmModel = true
+                isLoadVlmModel = false
+                vlmVisionConfig = null
+            }
+            active.vlm != null -> {
+                vlmWrapper = active.vlm
+                isLoadVlmModel = true
+                isLoadLlmModel = false
+                vlmVisionConfig = active.visionConfig
+            }
+            else -> return false
+        }
+
+        nativeRuntimeWasUsed = true
+        startupModelRestoreAttempted = true
+        selectModelId = model?.id ?: active.modelId
+        if (model != null) AppPreferences.setSelectedModelId(this, model.id)
+        DiagnosticsLogger.checkpoint(
+            "ACTIVE_MODEL_ADOPTED",
+            "model=${active.modelName} runtime=${active.runtimeId} compute=${active.computeUnit.orEmpty()} context=${active.contextTokens}",
+        )
+        updateUiForLoadedModel()
+        return true
+    }
+
     private fun maybeRestoreStartupModel() {
         if (!sdkReady || !uiReady || startupModelRestoreAttempted || hasLoadedModel()) return
+        if (adoptProcessModelIfPresent()) return
 
         // A prior process death during native creation may indicate an incompatible
         // or too-large model. Do not auto-enter a crash loop; let the warning be
@@ -582,9 +617,10 @@ class MainActivity : FragmentActivity() {
         val supported = model.getSupportPluginIds()
         if (preferred in supported) return preferred
         val npu = ComputeUnitValue.NPU.value ?: "npu"
+        val hybrid = "hybrid"
         val gpu = ComputeUnitValue.GPU.value ?: "gpu"
         val cpu = ComputeUnitValue.CPU.value ?: "cpu"
-        return listOf(npu, gpu, cpu).firstOrNull { it in supported }
+        return listOf(npu, hybrid, gpu, cpu).firstOrNull { it in supported }
             ?: supported.firstOrNull()
             ?: npu
     }
@@ -718,6 +754,10 @@ class MainActivity : FragmentActivity() {
         bypassFreshRuntimeGuard: Boolean = false,
     ) {
         val requestedCompute: String = deviceId ?: ComputeUnitValue.NPU.value ?: "npu"
+        // A foreground service may have kept the process-owned model alive while
+        // this Activity was recreated. Adopt it before deciding whether this is
+        // a new load or a model switch.
+        if (!hasLoadedModel() && InferenceBridge.isLoaded()) adoptProcessModelIfPresent()
         if (hasLoadedModel()) {
             switchLoadedModel(selectModelData, requestedCompute)
             return
@@ -995,6 +1035,7 @@ class MainActivity : FragmentActivity() {
                                 requestedCompute,
                                 pluginId,
                                 if (isNpuVlm) PerformanceTuning.QAIRT_CONTEXT_BUDGET_TOKENS else vlmContextSize(vlmVisionConfig),
+                                vlmVisionConfig,
                             )
                             DiagnosticsLogger.markModelLoadComplete("${selectModelData.modelName} compute=$requestedCompute")
                             AppPreferences.rememberSuccessfulModelLoad(
@@ -1579,6 +1620,7 @@ class MainActivity : FragmentActivity() {
         dialogBinding.rbCpu.visibility = if ("cpu" in supported) View.VISIBLE else View.GONE
         dialogBinding.rbGpu.visibility = if ("gpu" in supported) View.VISIBLE else View.GONE
         dialogBinding.rbNpu.visibility = if ("npu" in supported) View.VISIBLE else View.GONE
+        dialogBinding.rbHybrid.visibility = if ("hybrid" in supported) View.VISIBLE else View.GONE
         dialogBinding.llGpuLayers.visibility = View.GONE
 
         when {
@@ -1596,6 +1638,7 @@ class MainActivity : FragmentActivity() {
                             val computeUnit = when (checkedId) {
                                 R.id.rb_gpu -> ComputeUnitValue.GPU.value
                                 R.id.rb_cpu -> ComputeUnitValue.CPU.value
+                                R.id.rb_hybrid -> "hybrid"
                                 else -> ComputeUnitValue.NPU.value
                             }
                             // GenieX rewrites the layer count for the selected compute
@@ -1621,7 +1664,7 @@ class MainActivity : FragmentActivity() {
         val alertDialog =
             AlertDialog.Builder(this)
                 .setTitle("Compute unit")
-                .setMessage("Choose where this model should run. Diagnostics record the requested backend and SDK logs for troubleshooting.")
+                .setMessage("Choose where this model should run. Hybrid still uses Hexagon NPU acceleration but lets llama.cpp schedule unsupported work efficiently on CPU.")
                 .setView(dialogBinding.root)
                 .setNegativeButton("Cancel", dialogOnClickListener)
                 .setPositiveButton("Load", dialogOnClickListener)

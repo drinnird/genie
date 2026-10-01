@@ -27,6 +27,14 @@
             android:visibility="gone" />
 
         <RadioButton
+            android:id="@+id/rb_hybrid"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Hybrid — Hexagon NPU + CPU scheduler"
+            android:visibility="gone"
+            tools:visibility="visible" />
+
+        <RadioButton
             android:id="@+id/rb_gpu"
             android:layout_width="match_parent"
             android:layout_height="48dp"

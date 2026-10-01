@@ -106,3 +106,9 @@ For Qwen3.5 text-only llama.cpp requests, GenieX now renders the supported ChatM
 The bundled web chat now requests the app's safe maximum output budget (currently 2048 tokens) instead of hard-coding 512. The inference bridge still reduces that number automatically when the current prompt/history needs more of the model context window. Assistant responses render common Markdown safely in the browser, and streaming output no longer forces the page back to the bottom after the user scrolls upward.
 
 The foreground API service already holds a partial CPU wake lock for the server lifetime and a high-performance Wi-Fi lock in LAN mode. The Server screen now links to background-power controls (including Samsung's Never sleeping apps screen when available), and diagnostics record screen/Doze/power-saver state plus wake/Wi-Fi lock status to make any remaining screen-off throttling measurable.
+
+## v22.9 smoother browser token streaming
+
+Browser streaming is now paced to the display instead of two coarse batching timers. The local API SSE buffer flushes about once per display frame (16 ms / 32 characters) rather than 50 ms / 96 characters, and the browser coalesces Markdown repaint work with `requestAnimationFrame()` instead of a fixed 90 ms delay. Fast awake-device generation therefore appears continuously streamed while still avoiding a full Markdown re-render for every tiny network fragment.
+
+The API also records end-of-stream telemetry (first-output delay, streamed characters/chunks/native output pieces, elapsed time, approximate characters per second, and current screen/idle/power state). This makes screen-off inference throttling measurable separately from browser rendering behavior.

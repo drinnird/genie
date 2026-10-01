@@ -423,3 +423,16 @@ See `AUDIT_V22_5.md` for the regression and static-validation details.
 - Confirmed the foreground API service already holds a partial CPU wake lock for the full server session and a high-performance Wi-Fi lock in LAN mode. No redundant permanent lock was added.
 - Added Server-screen background-power settings. Samsung devices use Samsung's documented Never sleeping apps deep link when available; other devices open Android battery optimization settings.
 - API diagnostics now include requested max tokens plus screen-on/off, idle mode, power-saver state, and battery-optimization exemption. Service startup logs wake/Wi-Fi lock-held state.
+
+## v22.9 browser stream pacing + screen-off telemetry (2026-09-30)
+
+- Replaced the browser's fixed 90 ms Markdown repaint timer with one coalesced `requestAnimationFrame()` update. A 50 ms fallback remains only for browsers/tabs where animation frames are suspended.
+- Reduced server SSE coalescing from 50 ms / 96 characters to 16 ms / 32 characters. This keeps socket/JSON overhead bounded but avoids visibly bursty output when the model is generating quickly.
+- Added completion telemetry for streamed web chat: first-output latency, streamed character count, SSE chunk count, native output-piece count, total duration, approximate characters/sec, and screen/idle/power-saver/battery-exemption state.
+- No additional wake lock was added. The server service already owns the partial CPU wake lock for its lifetime and the high-performance Wi-Fi lock in LAN mode. This revision separates visual buffering from actual device-side throttling so diagnostics can quantify any remaining screen-off slowdown.
+
+## v22.10
+- Prevent duplicate native model loads when MainActivity is recreated while the foreground server keeps the process/model alive; the Activity adopts the process-owned InferenceBridge wrapper instead.
+- Preserve VLM vision configuration across Activity recreation.
+- Add an explicit `hybrid` compute choice for Q4 GGUF models. Existing `npu` semantics remain pinned HTP0.
+- Diagnostics from 2026-09-30 show screen-off generation lasting ~1.96x longer than a comparable screen-on request despite active CPU/Wi-Fi locks and no Doze/power-saver state; v22.9 stream metrics should be used for the next exact throughput comparison.

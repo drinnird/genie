@@ -425,26 +425,60 @@
 
   const pendingMarkdown = new WeakMap();
 
-  function setBubblePlain(bubble, text) {
+  function cancelPendingMarkdown(bubble) {
     const state = pendingMarkdown.get(bubble);
-    if (state?.timer) clearTimeout(state.timer);
+    if (!state) return;
+    if (state.frame) cancelAnimationFrame(state.frame);
+    if (state.fallback) clearTimeout(state.fallback);
     pendingMarkdown.delete(bubble);
+  }
+
+  function renderPendingMarkdown(bubble) {
+    const state = pendingMarkdown.get(bubble);
+    if (!state) return;
+    if (state.fallback) clearTimeout(state.fallback);
+    const follow = followOutput;
+    bubble.innerHTML = markdownToHtml(state.text);
+    pendingMarkdown.delete(bubble);
+    if (follow) scrollBottom();
+  }
+
+  function setBubblePlain(bubble, text) {
+    cancelPendingMarkdown(bubble);
     bubble.classList.remove('markdown');
     bubble.textContent = text;
   }
 
   function setBubbleMarkdown(bubble, text, immediate = false) {
     bubble.classList.add('markdown');
-    const previous = pendingMarkdown.get(bubble);
-    if (previous?.timer) clearTimeout(previous.timer);
-    const render = () => {
+    if (immediate) {
+      cancelPendingMarkdown(bubble);
       const follow = followOutput;
       bubble.innerHTML = markdownToHtml(text);
-      pendingMarkdown.delete(bubble);
       if (follow) scrollBottom();
-    };
-    if (immediate) render();
-    else pendingMarkdown.set(bubble, { timer: setTimeout(render, 90) });
+      return;
+    }
+
+    let state = pendingMarkdown.get(bubble);
+    if (state) {
+      // Keep just the newest complete text. One animation-frame render consumes
+      // every token that arrived since the previous paint without adding a
+      // coarse artificial delay to fast generation.
+      state.text = text;
+      return;
+    }
+
+    state = { text, frame: 0, fallback: 0 };
+    pendingMarkdown.set(bubble, state);
+    state.frame = requestAnimationFrame(() => renderPendingMarkdown(bubble));
+    // requestAnimationFrame may be suspended in a background browser tab.
+    // Keep a bounded fallback so the DOM still advances for non-visible clients.
+    state.fallback = setTimeout(() => {
+      const current = pendingMarkdown.get(bubble);
+      if (!current) return;
+      if (current.frame) cancelAnimationFrame(current.frame);
+      renderPendingMarkdown(bubble);
+    }, 50);
   }
 
   function addBubble(role, text = '', error = false) {

@@ -30,7 +30,7 @@ data class ModelData(
     val computeSummary: String
         get() = when (runtime) {
             "qairt" -> "NPU"
-            else -> if (isQ4Quant) "NPU / GPU / CPU" else "GPU / CPU"
+            else -> if (isQ4Quant) "NPU / Hybrid / GPU / CPU" else "GPU / CPU"
         }
 }
 
@@ -38,13 +38,13 @@ data class ModelData(
  * Compute units exposed by the UI.
  *
  * QAIRT bundles are NPU-only. For llama.cpp models the app follows the
- * product policy requested for this fork: Q4* quantizations expose NPU,
- * GPU, and CPU; other quantizations expose GPU and CPU only.
+ * product policy requested for this fork: Q4* quantizations expose pinned NPU,
+ * hybrid HTP+CPU, GPU, and CPU; other quantizations expose GPU and CPU only.
  */
 fun ModelData.getSupportPluginIds(): ArrayList<String> =
     when (runtime) {
         "qairt" -> arrayListOf("npu")
-        else -> if (isQ4Quant) arrayListOf("npu", "gpu", "cpu") else arrayListOf("gpu", "cpu")
+        else -> if (isQ4Quant) arrayListOf("npu", "hybrid", "gpu", "cpu") else arrayListOf("gpu", "cpu")
     }
 
 fun ModelData.isNpuModel(): Boolean = runtime == "qairt"

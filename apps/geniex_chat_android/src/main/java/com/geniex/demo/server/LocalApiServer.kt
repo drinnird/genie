@@ -319,20 +319,40 @@ object LocalApiServer {
         val id = "chatcmpl-${UUID.randomUUID()}"
         val model = InferenceBridge.activeModelId ?: "loaded-model"
         val created = System.currentTimeMillis() / 1000L
+        val startedMs = SystemClock.elapsedRealtime()
+        var firstOutputMs = 0L
+        var nativePieces = 0
+        var streamedChars = 0
+        var streamedChunks = 0
         writeSseHeaders(output)
         writeSseData(output, chatChunkJson(id, model, created, role = "assistant"))
 
         val chunks = TokenChunker { text ->
+            if (firstOutputMs == 0L) firstOutputMs = SystemClock.elapsedRealtime()
+            streamedChars += text.length
+            streamedChunks += 1
             writeSseData(output, chatChunkJson(id, model, created, content = text))
         }
         val result = runBlocking {
             InferenceBridge.streamText(messages, enableThinking, maxTokens) { token ->
+                nativePieces += 1
                 chunks.append(token)
             }
         }
         result.fold(
             onSuccess = {
                 chunks.flush()
+                val finishedMs = SystemClock.elapsedRealtime()
+                val durationMs = (finishedMs - startedMs).coerceAtLeast(1L)
+                val firstOutputDelayMs = if (firstOutputMs > 0L) firstOutputMs - startedMs else durationMs
+                val charsPerSecond = streamedChars * 1000.0 / durationMs
+                DiagnosticsLogger.log(
+                    "INFO",
+                    "ApiServer",
+                    "chat stream complete chars=$streamedChars chunks=$streamedChunks pieces=$nativePieces " +
+                        "durationMs=$durationMs firstOutputMs=$firstOutputDelayMs charsPerSec=${"%.1f".format(java.util.Locale.US, charsPerSecond)} " +
+                        powerStateSummary(),
+                )
                 writeSseData(output, chatChunkJson(id, model, created, finishReason = "stop"))
                 writeSseDone(output)
             },
@@ -991,8 +1011,10 @@ object LocalApiServer {
         }
     }
 
-    private const val SSE_FLUSH_CHARS = 96
-    private const val SSE_FLUSH_MS = 50L
+    // Pace SSE output close to a display frame. This preserves smooth token
+    // streaming without forcing a socket flush for every tiny native token.
+    private const val SSE_FLUSH_CHARS = 32
+    private const val SSE_FLUSH_MS = 16L
 
     private const val FALLBACK_WEB_UI = """<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>GenieX Local</title></head><body><h1>GenieX Local</h1><p>The bundled web chat UI could not be loaded. The API remains available at <code>/v1</code>.</p></body></html>"""
 }
