@@ -48,8 +48,12 @@ class ChatAdapter(
     private val messages: List<Message>,
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
     // Markwon (especially tables/LaTeX) is relatively expensive to construct.
-    // Keep one renderer per adapter instead of one per recycled ViewHolder.
+    // Keep one full renderer and one lighter streaming renderer per adapter.
+    // The streaming renderer intentionally omits LaTeX so growing output can
+    // be reformatted several times per second without repeatedly building math
+    // render trees. Completion gets one full render with LaTeX enabled.
     private var markdownRenderer: Markwon? = null
+    private var streamingMarkdownRenderer: Markwon? = null
 
     private fun markwon(context: Context): Markwon =
         markdownRenderer ?:
@@ -66,6 +70,17 @@ class ChatAdapter(
                     },
                 ).build()
                 .also { markdownRenderer = it }
+
+    private fun streamingMarkwon(context: Context): Markwon =
+        streamingMarkdownRenderer ?:
+            Markwon
+                .builder(context)
+                .usePlugin(StrikethroughPlugin.create())
+                .usePlugin(TablePlugin.create(context))
+                .usePlugin(LinkifyPlugin.create())
+                .usePlugin(MarkwonInlineParserPlugin.create())
+                .build()
+                .also { streamingMarkdownRenderer = it }
     override fun getItemViewType(position: Int): Int {
         val message = messages[position]
         return message.type.value
@@ -83,7 +98,11 @@ class ChatAdapter(
             }
 
             MessageType.ASSISTANT -> {
-                AiViewHolder(inflater.inflate(R.layout.item_ai_message, parent, false), markwon(parent.context))
+                AiViewHolder(
+                    inflater.inflate(R.layout.item_ai_message, parent, false),
+                    markwon(parent.context),
+                    streamingMarkwon(parent.context),
+                )
             }
 
             MessageType.IMAGES -> {
@@ -150,19 +169,25 @@ class ChatAdapter(
     class AiViewHolder(
         itemView: View,
         private val markwon: Markwon,
+        private val streamingMarkwon: Markwon,
     ) : RecyclerView.ViewHolder(itemView) {
         private val tvMessage: TextView = itemView.findViewById(R.id.tv_message)
 
         fun bind(message: Message) {
             val markdown = MarkdownNormalizer.normalize(message.content.trim())
             markwon.setMarkdown(tvMessage, markdown)
+            tvMessage.setTextIsSelectable(true)
             tvMessage.movementMethod = LinkMovementMethod.getInstance()
         }
 
         fun bindStreaming(message: Message) {
-            // Markdown parsing on every token creates a large amount of short-lived
-            // objects. Stream plain text and do one full Markdown render at completion.
-            tvMessage.text = message.content
+            // Apply Markdown progressively, but with the lighter renderer. MainActivity
+            // throttles these binds so we do not parse the entire growing response on
+            // every native output piece. Links/selection are enabled at completion to
+            // avoid touch/focus churn while the RecyclerView item is changing height.
+            val markdown = MarkdownNormalizer.normalize(message.content)
+            streamingMarkwon.setMarkdown(tvMessage, markdown)
+            tvMessage.setTextIsSelectable(false)
             tvMessage.movementMethod = null
         }
     }
@@ -232,6 +257,6 @@ class ChatAdapter(
     }
 
     companion object {
-        const val PAYLOAD_STREAM_TEXT = "stream_text"
+        const val PAYLOAD_STREAM_TEXT = "stream_markdown"
     }
 }

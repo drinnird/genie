@@ -32,8 +32,11 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
+import androidx.core.view.doOnNextLayout
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.FragmentActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.geniex.demo.bean.ModelData
 import com.geniex.demo.bean.getSupportPluginIds
 import com.geniex.demo.databinding.ActivityMainBinding
@@ -148,6 +151,9 @@ class MainActivity : FragmentActivity() {
     private var loadingMessageIndex: Int = -1
     private var streamingMessageIndex: Int = -1
     private var lastStreamUiUpdateMs: Long = 0L
+    private var chatAutoFollowEnabled = true
+    private var chatUserDragging = false
+    private var chatBottomScrollPending = false
     @Volatile private var sdkReady = false
     private var uiReady = false
     @Volatile private var nativeRuntimeWasUsed = false
@@ -200,6 +206,29 @@ class MainActivity : FragmentActivity() {
     private fun initView() {
         adapter = ChatAdapter(messages)
         binding.rvChat.adapter = adapter
+        binding.rvChat.addOnScrollListener(
+            object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                    when (newState) {
+                        RecyclerView.SCROLL_STATE_DRAGGING -> chatUserDragging = true
+                        RecyclerView.SCROLL_STATE_IDLE -> {
+                            if (chatUserDragging) {
+                                chatAutoFollowEnabled = isChatNearBottom()
+                            }
+                            chatUserDragging = false
+                        }
+                    }
+                }
+
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    // Only a gesture is allowed to opt out of auto-follow. Programmatic
+                    // scrolling during streaming must not accidentally disable itself.
+                    if (chatUserDragging) {
+                        chatAutoFollowEnabled = isChatNearBottom()
+                    }
+                }
+            },
+        )
 
         llDownloading = findViewById(R.id.ll_downloading)
         tvDownloadProgress = findViewById(R.id.tv_download_progress)
@@ -1746,7 +1775,9 @@ class MainActivity : FragmentActivity() {
             is LlmStreamResult.Token -> {
                 sb.append(streamResult.text)
                 val now = SystemClock.uptimeMillis()
-                if (now - lastStreamUiUpdateMs >= STREAM_UI_UPDATE_MS) {
+                val structuralBoundary =
+                    streamResult.text.indexOf('\n') >= 0 || streamResult.text.contains("```")
+                if (structuralBoundary || now - lastStreamUiUpdateMs >= STREAM_UI_UPDATE_MS) {
                     lastStreamUiUpdateMs = now
                     postStreamingAssistantText(sb.toString(), finalRender = false)
                 }
@@ -1777,10 +1808,9 @@ class MainActivity : FragmentActivity() {
                         "TTFT: $ttft ms; Prompt Tokens: $promptTokens; \nPrefilling Speed: $prefillSpeed tok/s\nGenerated Tokens: $generatedTokens; Decoding Speed: $decodingSpeed tok/s"
                     messages.add(Message(profileData, MessageType.PROFILE))
                     adapter.notifyItemInserted(messages.lastIndex)
-                    binding.rvChat.scrollToPosition(messages.lastIndex)
                     streamingMessageIndex = -1
                     trimUiTranscriptForMemory()
-                    if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
+                    requestChatBottomScroll()
                 }
                 Log.d(TAG, "Completed: ${streamResult.profile}")
             }
@@ -1793,7 +1823,7 @@ class MainActivity : FragmentActivity() {
                     adapter.notifyItemInserted(messages.lastIndex)
                     streamingMessageIndex = -1
                     trimUiTranscriptForMemory()
-                    if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
+                    requestChatBottomScroll()
                 }
                 Log.d(TAG, "Error: $streamResult")
             }
@@ -1816,7 +1846,56 @@ class MainActivity : FragmentActivity() {
                     adapter.notifyItemChanged(idx, ChatAdapter.PAYLOAD_STREAM_TEXT)
                 }
             }
-            binding.rvChat.scrollToPosition(messages.lastIndex)
+            requestChatBottomScroll()
+        }
+    }
+
+    /**
+     * True when the user is already at (or very near) the bottom of the chat.
+     * This is intentionally based on the decorated bottom of the last item, not
+     * just its adapter position: a single long streaming answer can be taller
+     * than the entire RecyclerView while still being the "last visible item".
+     */
+    private fun isChatNearBottom(): Boolean {
+        if (messages.isEmpty()) return true
+        val recycler = binding.rvChat
+        val layoutManager = recycler.layoutManager as? LinearLayoutManager ?: return !recycler.canScrollVertically(1)
+        if (layoutManager.findLastVisibleItemPosition() < messages.lastIndex) return false
+        val lastView = layoutManager.findViewByPosition(messages.lastIndex) ?: return !recycler.canScrollVertically(1)
+        val viewportBottom = recycler.height - recycler.paddingBottom
+        val thresholdPx = (CHAT_BOTTOM_THRESHOLD_DP * resources.displayMetrics.density).toInt()
+        return layoutManager.getDecoratedBottom(lastView) - viewportBottom <= thresholdPx
+    }
+
+    /**
+     * Keep a streaming answer pinned to its actual bottom after RecyclerView has
+     * remeasured the Markdown TextView. scrollToPosition(lastIndex) is not enough
+     * when the last message is taller than the viewport: it can anchor the item's
+     * top/middle and repeatedly hide newly appended text.
+     *
+     * A user drag disables this behavior until they manually return near bottom.
+     */
+    private fun requestChatBottomScroll(force: Boolean = false) {
+        if (force) chatAutoFollowEnabled = true
+        if (!chatAutoFollowEnabled || messages.isEmpty() || chatBottomScrollPending) return
+        chatBottomScrollPending = true
+        binding.rvChat.doOnNextLayout { recycler ->
+            chatBottomScrollPending = false
+            if (!chatAutoFollowEnabled || messages.isEmpty()) return@doOnNextLayout
+            val layoutManager = recycler.layoutManager as? LinearLayoutManager ?: return@doOnNextLayout
+            val lastPosition = messages.lastIndex
+            val lastView = layoutManager.findViewByPosition(lastPosition)
+            if (lastView == null) {
+                // Initial insertion can be off-screen. Bring it into layout first;
+                // the posted pass then bottom-aligns the now-attached item.
+                layoutManager.scrollToPositionWithOffset(lastPosition, 0)
+                recycler.post { requestChatBottomScroll() }
+                return@doOnNextLayout
+            }
+            val viewportBottom = recycler.height - recycler.paddingBottom
+            val itemBottom = layoutManager.getDecoratedBottom(lastView)
+            val dy = itemBottom - viewportBottom
+            if (dy > 0) recycler.scrollBy(0, dy)
         }
     }
 
@@ -2254,12 +2333,13 @@ class MainActivity : FragmentActivity() {
 
     private fun reloadRecycleView() {
         adapter.notifyDataSetChanged()
-        if (messages.isNotEmpty()) binding.rvChat.scrollToPosition(messages.lastIndex)
+        requestChatBottomScroll(force = true)
     }
 
     private fun showLoadingIndicator() {
         runOnUiThread {
             if (loadingMessageIndex >= 0) return@runOnUiThread
+            chatAutoFollowEnabled = true
             messages.add(Message("", MessageType.LOADING))
             loadingMessageIndex = messages.size - 1
             reloadRecycleView()
@@ -2311,7 +2391,11 @@ class MainActivity : FragmentActivity() {
         private const val GPU_MIN_EXTRA_HEADROOM_BYTES = GIB_BYTES
         private const val MODEL_UNLOAD_SETTLE_MS = 1500L
         private const val FALLBACK_VLM_IMAGE_SIZE = 448
-        private const val STREAM_UI_UPDATE_MS = 80L
+        // Progressive Markdown is intentionally frame-ish rather than per-token.
+        // Parsing a growing document on every native output piece causes avoidable
+        // UI allocations; ~6-7 renders/sec is visually continuous without jank.
+        private const val STREAM_UI_UPDATE_MS = 150L
+        private const val CHAT_BOTTOM_THRESHOLD_DP = 72
 
         /** Room for an image, its answer, and a follow-up turn, over the image cost. */
         private const val VLM_CTX_HEADROOM = 2048

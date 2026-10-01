@@ -459,3 +459,13 @@ Validation for this revision:
 - project-wide Kotlin PSI parser sweep: 32 files, zero syntax errors
 - targeted `MarkdownNormalizer` Kotlin compile/test: pass, including the malformed five-column oxygen-mask table and fenced-code preservation
 - full Android Gradle build remains unavailable in this sandbox because the `gradle` executable/Android SDK are not installed (`gradle: command not found`)
+
+## v22.12 progressive Android Markdown + streaming scroll fix
+
+- Added a cached lightweight Markwon renderer for in-progress assistant output.
+- Streaming Markdown refreshes approximately every 150 ms and immediately at newline/code-fence boundaries.
+- Full Markwon + LaTeX remains the completion renderer.
+- Disabled selection/link movement during streaming to avoid focus/measurement churn.
+- Replaced per-update `RecyclerView.scrollToPosition(lastIndex)` with post-layout bottom-edge alignment.
+- User dragging disables auto-follow until the RecyclerView returns within 72dp of the actual bottom.
+- Completion/error/profile insertion no longer forces the user back to the bottom after they intentionally scroll upward.

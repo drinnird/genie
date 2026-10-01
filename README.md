@@ -118,3 +118,14 @@ The API also records end-of-stream telemetry (first-output delay, streamed chara
 For a loaded model that supports more than one compute backend, tap the active model status in the chat header or choose **Change compute** from the gear menu. Q4 GGUF models can switch among NPU, Hybrid, GPU, and CPU; models with narrower runtime support only show valid choices. GenieX unloads the current wrapper before reloading the same model on the selected backend, using a clean inference-process restart to avoid overlapping large GPU/HTP allocations. The remembered startup compute choice changes only after the replacement backend loads successfully.
 
 Completed assistant messages in the Android chat use Markwon Markdown rendering. The app also repairs common model-generated table syntax mistakes before rendering, including accidentally merged alignment cells and unnecessary trailing backslashes, while leaving fenced code blocks untouched. Assistant messages can now use the full available chat width so tables and code blocks are easier to read.
+
+## v22.12 progressive Markdown and stable streaming scroll
+
+Android assistant responses now render Markdown progressively while tokens are arriving.
+The streaming renderer intentionally omits LaTeX for efficiency; completion performs the
+full LaTeX-capable render. Updates are throttled rather than reparsing on every token.
+
+Chat auto-follow now tracks the measured bottom edge of the final message instead of only
+scrolling to its adapter position. This fixes long responses whose final bubble grows taller
+than the screen. Dragging away from the bottom disables auto-follow until the user returns
+near the bottom, so the UI no longer fights manual scrolling during generation.
