@@ -112,3 +112,9 @@ The foreground API service already holds a partial CPU wake lock for the server 
 Browser streaming is now paced to the display instead of two coarse batching timers. The local API SSE buffer flushes about once per display frame (16 ms / 32 characters) rather than 50 ms / 96 characters, and the browser coalesces Markdown repaint work with `requestAnimationFrame()` instead of a fixed 90 ms delay. Fast awake-device generation therefore appears continuously streamed while still avoiding a full Markdown re-render for every tiny network fragment.
 
 The API also records end-of-stream telemetry (first-output delay, streamed characters/chunks/native output pieces, elapsed time, approximate characters per second, and current screen/idle/power state). This makes screen-off inference throttling measurable separately from browser rendering behavior.
+
+## v22.11 compute switching and Android Markdown
+
+For a loaded model that supports more than one compute backend, tap the active model status in the chat header or choose **Change compute** from the gear menu. Q4 GGUF models can switch among NPU, Hybrid, GPU, and CPU; models with narrower runtime support only show valid choices. GenieX unloads the current wrapper before reloading the same model on the selected backend, using a clean inference-process restart to avoid overlapping large GPU/HTP allocations. The remembered startup compute choice changes only after the replacement backend loads successfully.
+
+Completed assistant messages in the Android chat use Markwon Markdown rendering. The app also repairs common model-generated table syntax mistakes before rendering, including accidentally merged alignment cells and unnecessary trailing backslashes, while leaving fenced code blocks untouched. Assistant messages can now use the full available chat width so tables and code blocks are easier to read.

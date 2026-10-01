@@ -323,11 +323,21 @@ class MainActivity : FragmentActivity() {
                 btnLoadModel.text = if (available) "Load model" else "Download in Models"
                 btnUnloadModel.visibility = View.GONE
                 btnStop.visibility = if (anyModelLoaded && isGenerating) View.VISIBLE else View.GONE
+                val activeCompute = InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary
+                val canChangeCompute = active && model.getSupportPluginIds().size > 1
                 tvSelectedModelStatus.text = when {
-                    active -> "Active • ${InferenceBridge.requestedComputeUnit?.uppercase() ?: model.computeSummary}"
+                    canChangeCompute -> "Active • $activeCompute • tap to change compute"
+                    active -> "Active • $activeCompute"
                     anyModelLoaded -> "Ready to switch • ${model.computeSummary}"
                     available -> "Ready to load • ${model.computeSummary}"
                     else -> "Not downloaded • ${model.computeSummary}"
+                }
+                tvSelectedModelStatus.isClickable = canChangeCompute
+                tvSelectedModelStatus.isFocusable = canChangeCompute
+                tvSelectedModelStatus.contentDescription = if (canChangeCompute) {
+                    "Active on $activeCompute. Tap to change compute unit."
+                } else {
+                    tvSelectedModelStatus.text
                 }
             }
         }
@@ -655,25 +665,37 @@ class MainActivity : FragmentActivity() {
     }
 
     /**
-     * Switch models without asking the user to manually unload first. GenieX
-     * native/driver allocations are safest when the replacement model starts in
-     * a fresh process, so the active wrapper is destroyed first and the existing
-     * restart hand-off loads the requested model automatically.
+     * Switch either the active model or the active model's compute backend.
+     * GenieX native/driver allocations are safest when the replacement runtime
+     * starts in a fresh process, so the active wrapper is destroyed first and
+     * the restart hand-off reloads the requested model automatically.
      */
     private fun switchLoadedModel(
         selectModelData: ModelData,
         requestedCompute: String,
     ) {
-        if (InferenceBridge.activeModelId == selectModelData.id) {
-            Toast.makeText(this, "${selectModelData.displayName} is already active.", Toast.LENGTH_SHORT).show()
+        val sameModel = InferenceBridge.activeModelId == selectModelData.id
+        val currentCompute = InferenceBridge.requestedComputeUnit
+        if (sameModel && currentCompute.equals(requestedCompute, ignoreCase = true)) {
+            llLoading.visibility = View.INVISIBLE
+            vTip.visibility = View.GONE
+            Toast.makeText(
+                this,
+                "${selectModelData.displayName} is already active on ${requestedCompute.uppercase()}.",
+                Toast.LENGTH_SHORT,
+            ).show()
             return
         }
         if (modelLoadJob?.isActive == true) {
+            llLoading.visibility = View.INVISIBLE
+            vTip.visibility = View.GONE
             Toast.makeText(this, "A model operation is already in progress.", Toast.LENGTH_SHORT).show()
             return
         }
         if (DocumentProcessor.isProcessing() || isGenerating) {
-            Toast.makeText(this, "Finish or stop the current inference before switching models.", Toast.LENGTH_SHORT).show()
+            llLoading.visibility = View.INVISIBLE
+            vTip.visibility = View.GONE
+            Toast.makeText(this, "Finish or stop the current inference before switching compute/model.", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -704,8 +726,8 @@ class MainActivity : FragmentActivity() {
                 }
 
                 DiagnosticsLogger.checkpoint(
-                    "MODEL_SWITCH_UNLOAD_COMPLETE",
-                    "next=${selectModelData.modelName} compute=$requestedCompute",
+                    if (sameModel) "COMPUTE_SWITCH_UNLOAD_COMPLETE" else "MODEL_SWITCH_UNLOAD_COMPLETE",
+                    "next=${selectModelData.modelName} from=${currentCompute.orEmpty()} compute=$requestedCompute",
                 )
                 runOnUiThread {
                     // Visible chat belongs to the unloaded native conversation.
@@ -1130,11 +1152,17 @@ class MainActivity : FragmentActivity() {
     private fun showAppMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add(0, MENU_MANAGE_MODELS, 0, "Manage models")
-            menu.add(0, MENU_WEB_SERVER, 1, "Web server")
-            menu.add(0, MENU_DIAGNOSTICS, 2, "Diagnostics")
+            activeModelForComputeSwitch()?.takeIf { it.getSupportPluginIds().size > 1 }?.let {
+                val current = InferenceBridge.requestedComputeUnit?.uppercase().orEmpty()
+                val suffix = if (current.isBlank()) "" else " • $current"
+                menu.add(0, MENU_CHANGE_COMPUTE, 1, "Change compute$suffix")
+            }
+            menu.add(0, MENU_WEB_SERVER, 2, "Web server")
+            menu.add(0, MENU_DIAGNOSTICS, 3, "Diagnostics")
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_MANAGE_MODELS -> btnModels.performClick()
+                    MENU_CHANGE_COMPUTE -> showComputePickerForActiveModel()
                     MENU_WEB_SERVER -> btnServer.performClick()
                     MENU_DIAGNOSTICS -> btnDiagnostics.performClick()
                     else -> return@setOnMenuItemClickListener false
@@ -1143,6 +1171,24 @@ class MainActivity : FragmentActivity() {
             }
             show()
         }
+    }
+
+    private fun activeModelForComputeSwitch(): ModelData? {
+        val activeId = InferenceBridge.activeModelId ?: return null
+        return modelList.firstOrNull { it.id == activeId }
+    }
+
+    private fun showComputePickerForActiveModel() {
+        val model = activeModelForComputeSwitch()
+        if (model == null || !hasLoadedModel()) {
+            Toast.makeText(this, "Load a model first.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (model.getSupportPluginIds().size <= 1) {
+            Toast.makeText(this, "${model.displayName} only supports NPU on this runtime.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startLoadModel(model)
     }
 
     private fun requestModelUnload() {
@@ -1219,6 +1265,9 @@ class MainActivity : FragmentActivity() {
             startActivity(Intent(this, DiagnosticsActivity::class.java))
         }
         btnSettingsMenu.setOnClickListener { showAppMenu(it) }
+        tvSelectedModelStatus.setOnClickListener {
+            if (hasLoadedModel()) showComputePickerForActiveModel()
+        }
 
         btnAddImage.setOnClickListener {
             openGallery()
@@ -1623,10 +1672,19 @@ class MainActivity : FragmentActivity() {
         dialogBinding.rbHybrid.visibility = if ("hybrid" in supported) View.VISIBLE else View.GONE
         dialogBinding.llGpuLayers.visibility = View.GONE
 
-        when {
-            "npu" in supported -> dialogBinding.rbNpu.isChecked = true
-            "gpu" in supported -> dialogBinding.rbGpu.isChecked = true
-            else -> dialogBinding.rbCpu.isChecked = true
+        val activeSameModel = InferenceBridge.activeModelId == selectModelData.id && hasLoadedModel()
+        val preferredCompute = if (activeSameModel) {
+            InferenceBridge.requestedComputeUnit
+        } else {
+            AppPreferences.getLastLoadedModel(this)
+                ?.takeIf { it.modelId == selectModelData.id }
+                ?.computeUnit
+        }
+        when (preferredSupportedCompute(selectModelData, preferredCompute.orEmpty())) {
+            "hybrid" -> dialogBinding.rbHybrid.isChecked = true
+            (ComputeUnitValue.GPU.value ?: "gpu") -> dialogBinding.rbGpu.isChecked = true
+            (ComputeUnitValue.CPU.value ?: "cpu") -> dialogBinding.rbCpu.isChecked = true
+            else -> dialogBinding.rbNpu.isChecked = true
         }
 
         val dialogOnClickListener =
@@ -1663,11 +1721,17 @@ class MainActivity : FragmentActivity() {
 
         val alertDialog =
             AlertDialog.Builder(this)
-                .setTitle("Compute unit")
-                .setMessage("Choose where this model should run. Hybrid still uses Hexagon NPU acceleration but lets llama.cpp schedule unsupported work efficiently on CPU.")
+                .setTitle(if (activeSameModel) "Change compute" else "Compute unit")
+                .setMessage(
+                    if (activeSameModel) {
+                        "Switch ${selectModelData.displayName} to another compute backend. The current model will be unloaded first, then reloaded cleanly."
+                    } else {
+                        "Choose where this model should run. Hybrid still uses Hexagon NPU acceleration but lets llama.cpp schedule unsupported work efficiently on CPU."
+                    },
+                )
                 .setView(dialogBinding.root)
                 .setNegativeButton("Cancel", dialogOnClickListener)
-                .setPositiveButton("Load", dialogOnClickListener)
+                .setPositiveButton(if (activeSameModel) "Switch" else "Load", dialogOnClickListener)
                 .setCancelable(false)
                 .create()
         alertDialog.show()
@@ -2234,6 +2298,7 @@ class MainActivity : FragmentActivity() {
         private const val MENU_MANAGE_MODELS = 4101
         private const val MENU_WEB_SERVER = 4102
         private const val MENU_DIAGNOSTICS = 4103
+        private const val MENU_CHANGE_COMPUTE = 4104
         private const val TAG = "GenieXDemo"
 
         /**

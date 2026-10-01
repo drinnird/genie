@@ -436,3 +436,26 @@ See `AUDIT_V22_5.md` for the regression and static-validation details.
 - Preserve VLM vision configuration across Activity recreation.
 - Add an explicit `hybrid` compute choice for Q4 GGUF models. Existing `npu` semantics remain pinned HTP0.
 - Diagnostics from 2026-09-30 show screen-off generation lasting ~1.96x longer than a comparable screen-on request despite active CPU/Wi-Fi locks and no Doze/power-saver state; v22.9 stream metrics should be used for the next exact throughput comparison.
+
+## v22.11 live compute switching + Android Markdown hardening
+
+- The active model's compute backend can now be changed after load without manually unloading first. For models that expose multiple backends, the header status becomes tappable and the gear menu adds **Change compute**.
+- Switching CPU/GPU/NPU/Hybrid uses the same safe lifecycle as model switching: finish/stop active inference, acquire the process inference lock, stop the API listener if needed, destroy the current wrapper, allow native/driver memory to settle, restart the inference process, and reload the same model on the requested backend. The previous successful compute preference is only replaced after the new backend finishes loading successfully.
+- Choosing the already-active backend is a no-op and now clears the temporary loading overlay correctly.
+- QAIRT bundles remain NPU-only; non-Q4 llama.cpp models continue exposing only the backends declared by the catalog policy.
+- Android assistant bubbles already used Markwon for completed responses; this revision hardens rendering with `MarkdownNormalizer`, which repairs common LLM table mistakes such as a joined separator (`:--- :---`) or literal trailing `\\` table-row continuations before Markwon parses the result.
+- Markdown repair deliberately skips fenced code blocks so code samples are never rewritten.
+- Assistant bubbles now use the available chat width rather than a 340dp cap, making multi-column tables and fenced code substantially more readable.
+- Streaming text remains lightweight plain text while generation is in progress; the completed response receives the full Markwon render (headings, lists, emphasis, links, fenced/inline code, tables, strikethrough, and LaTeX) to avoid reparsing a growing document on every token.
+
+Validation for this revision:
+
+- Android XML parse: pass (31 files)
+- model catalog JSON parse: pass
+- workflow YAML parse: pass
+- manifest project-component references: pass
+- Kotlin/Java local `R.*` resource references: pass
+- shell script `bash -n`: pass
+- project-wide Kotlin PSI parser sweep: 32 files, zero syntax errors
+- targeted `MarkdownNormalizer` Kotlin compile/test: pass, including the malformed five-column oxygen-mask table and fenced-code preservation
+- full Android Gradle build remains unavailable in this sandbox because the `gradle` executable/Android SDK are not installed (`gradle: command not found`)

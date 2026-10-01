@@ -154,7 +154,8 @@ class ChatAdapter(
         private val tvMessage: TextView = itemView.findViewById(R.id.tv_message)
 
         fun bind(message: Message) {
-            markwon.setMarkdown(tvMessage, message.content.trim())
+            val markdown = MarkdownNormalizer.normalize(message.content.trim())
+            markwon.setMarkdown(tvMessage, markdown)
             tvMessage.movementMethod = LinkMovementMethod.getInstance()
         }
 
